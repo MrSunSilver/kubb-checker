@@ -1,8 +1,8 @@
 # Kubb-Checker — Functional Specification Document (FSD)
 
-**Version:** 0.1  
-**Date:** 2026-04-19  
-**Status:** Draft  
+**Version:** 1.0.0
+**Date:** 2026-04-27
+**Status:** Draft
 **Author:** rolf@dubitzky.de
 
 ---
@@ -11,33 +11,35 @@
 
 ### 1.1 Purpose
 
-Kubb-Checker assists referees in a game of Kubb by automatically determining whether a throw is valid. Under official Kubb rules, a thrown baton must rotate at least 360° around its minor axis (end-over-end) between leaving the thrower's hand and hitting a Kubba (wooden block). Kubb-Checker measures this rotation using inertial sensors embedded in the batons and presents the verdict on a graphical web interface visible to all players.
+Kubb-Checker assists the referee of a Kubb game in objectively determining whether a throw was valid. A throw is valid when the baton rotated at least 360° around its minor axis (end-over-end) **and** rotated vertically — not horizontally like a helicopter throw — between leaving the thrower's hand and hitting a kubb (wooden target block).
 
 ### 1.2 Problem Statement
 
-Validating throws by visual inspection is subjective and error-prone, especially at high throwing speeds. Kubb-Checker provides an objective, sensor-based validation that eliminates disputes and enhances the fairness of the game.
+Validating throws by visual inspection is subjective and error-prone, especially at high speed or from a distance. Kubb-Checker embeds an inertial sensor in each baton, measures the throw flight in real time, and streams the verdict to the referee's Android phone via BLE. This eliminates judgment disputes and enforces consistent, objective rules.
 
-### 1.3 Users / Stakeholders
+### 1.3 Users & Stakeholders
 
-| Stakeholder | Role |
-|-------------|------|
-| Referee / Game Operator | Monitors the web interface to validate throws; manages device names, calibration, and statistics |
-| Players | Observe throw validity results on the web interface |
-| System Administrator | Handles firmware updates and device provisioning |
+| Role | Responsibility |
+|------|---------------|
+| Referee / Game Operator | Primary user of the Kubb-Checker-App. Monitors throw validity during play; pairs and calibrates batons before the game. |
+| Players | Throw the batons. Affected by the validity judgments but do not operate the system directly. |
+| System Administrator | Flashes firmware, programs NFC tags, manages OTA updates. |
 
 ### 1.4 Goals & Non-Goals
 
 **Goals:**
-- Measure and record baton rotation and flight parameters for each throw
-- Display real-time throw validity on a mobile-accessible web interface
-- Support at least 6 simultaneous baton sensors in a single game
-- Support wireless firmware updates for all devices
+- Automatically classify each throw as valid or invalid on both criteria: sufficient rotation (≥ 360° minor-axis) and correct rotation axis (vertical, not helicopter).
+- Transmit per-throw event data from each baton to the referee's Android phone via BLE.
+- Provide a clear, real-time visual display on the phone for all 6 batons in play.
+- Enable sensor calibration, baton naming, and threshold management from the app.
+- Support wireless OTA firmware updates for all sensor devices.
 
 **Non-Goals:**
-- Automated game scoring or full game management
-- Cloud connectivity or internet-based data sync
-- Audio or visual feedback on the baton itself (LEDs, buzzers)
-- Support for multiple simultaneous games
+- Automated game scoring, rule enforcement, or game management.
+- iOS app support (Android only for Phase 1–6).
+- Cloud connectivity, remote data storage, or multi-game history.
+- Real-time streaming to spectators or any display other than the referee's phone.
+- Audio or visual feedback (LEDs, buzzers) on the baton itself.
 
 ### 1.5 High-Level System Flow
 
@@ -45,22 +47,20 @@ Validating throws by visual inspection is subjective and error-prone, especially
 [Baton thrown]
      │
      ▼
-[Sensor: Detect throw start (IMU threshold)]
+[Kubb-Checker-Sensor: IMU samples throw flight]
      │
      ▼
-[Sensor: Integrate gyro data during flight]
+[Sensor: detect throw start / flight / impact]
+[Sensor: compute rotation axes, axis orientation, ToF, height, distance]
+     │  BLE Notify (Event-Characteristic)
+     ▼
+[Kubb-Checker-App (Android): receive and display verdict]
      │
      ▼
-[Sensor: Detect landing (impact spike)]
-     │
-     ▼
-[Sensor: Compute rotation, time-of-flight, max accel → send via ESP-NOW]
-     │
-     ▼
-[Hub: Receive, store, and classify throw (valid / invalid)]
-     │
-     ▼
-[Web Interface: Display result to all connected mobile clients]
+[Referee: red/green validity indicators on phone screen]
+
+[Referee: NFC tap on baton] → OOB BLE pairing
+[Referee: App → BLE WRITE (Control-Characteristic)] → calibrate / rename / set thresholds / OTA
 ```
 
 ---
@@ -69,931 +69,799 @@ Validating throws by visual inspection is subjective and error-prone, especially
 
 ### 2.1 Logical Architecture
 
-The system consists of two logical subsystems:
+The system has two logical tiers:
 
-**Kubb-Checker-Sensor** (embedded in each baton):
-- IMU data acquisition and integration
-- Flight event detection (throw start / landing)
-- Throw analysis and result computation
-- Battery monitoring
-- ESP-NOW client (star topology node)
+**Sensor tier** — up to 6 Kubb-Checker-Sensor devices, each embedded in a wooden baton. Each sensor independently detects throws and transmits event and telemetry data via BLE GATT notifications.
 
-**Kubb-Checker-Hub** (central device):
-- ESP-NOW server (star topology center)
-- Data aggregation and game statistics
-- WiFi Access Point host
-- Embedded HTTP web server
-- OTA coordinator
+**Display & Control tier** — a single Android phone running the Kubb-Checker-App, acting as BLE central. The app maintains up to 6 simultaneous peripheral connections and presents live throw-validity data and baton-management controls to the referee.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                       Mobile Devices                         │
-│                (browsers via WiFi 802.11 b/g/n)              │
-└─────────────────────────┬────────────────────────────────────┘
-                          │ HTTP (polling or WebSocket)
-                          ▼
-┌──────────────────────────────────────────────────────────────┐
-│                    Kubb-Checker-Hub                          │
-│  ┌───────────────┐  ┌───────────────┐  ┌─────────────────┐  │
-│  │  ESP-NOW RX   │  │  Data Store   │  │  HTTP Server    │  │
-│  │  (star hub)   │→ │  (RAM / NVS)  │→ │  (web UI + API) │  │
-│  └───────────────┘  └───────────────┘  └─────────────────┘  │
-└──────────────────────────┬───────────────────────────────────┘
-                           │ ESP-NOW (2.4 GHz)
-            ┌──────────────┼──────────────┐
-            ▼              ▼              ▼
-  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-  │  Sensor 1    │ │  Sensor 2    │ │  Sensor N≥6  │
-  │ ESP32-C3 +   │ │ ESP32-C3 +   │ │ ESP32-C3 +   │
-  │ BMI160 + bat │ │ BMI160 + bat │ │ BMI160 + bat │
-  └──────────────┘ └──────────────┘ └──────────────┘
-```
+Data flows:
+- **Sensor → App**: continuous telemetry (10 Hz), throw events (per throw, no loss), status on request or change.
+- **App → Sensor**: commands via Control-Characteristic (calibrate, rename, set thresholds, OTA trigger, start/stop).
+- **NFC tag → App**: OOB BLE pairing data (tap-to-pair).
 
 ### 2.2 Hardware / Platform Architecture
 
-#### Kubb-Checker-Sensor
+#### 2.2.1 Kubb-Checker-Sensor
 
-| Attribute | Value |
+| Parameter | Value |
 |-----------|-------|
 | MCU | ESP32-C3 |
 | IMU | Bosch BMI160 (gyroscope + accelerometer) |
 | IMU Interface | I2C |
-| Power | LiIon 1S cell (3.7 V nominal) |
-| Form Factor | Inside wooden baton (~300 mm × ~40 mm diameter) |
-| Quantity | ≥ 6 per game |
+| Form factor | Inside wooden baton, ~300 mm long × ~40 mm diameter |
+| Placement | Near center of gravity of the baton |
+| NFC tag | NTAG215 affixed to baton exterior |
+| Power | LiIon 1S cell (assumed); ADC-based SoC monitoring |
+| Quantity per game | ≥ 6 |
 
 **Axis Convention:**
-- **Major axis**: Along the baton's length (longitudinal)
-- **Minor axis**: Perpendicular to the baton's length (transverse)
-- A valid throw requires ≥ 360° rotation around the **minor axis** (end-over-end tumbling)
+- **Major axis**: Along the baton's length (longitudinal).
+- **Minor axis**: Perpendicular to the baton length (transverse / end-over-end).
+- A valid throw requires ≥ 360° rotation around the **minor axis**.
+- A helicopter throw is detected when the minor rotational axis points predominantly up or down (rather than toward the horizon).
 
-The BMI160 shall be mounted so that one of its gyroscope axes aligns with the baton's minor axis. The axis mapping (which BMI160 axis corresponds to major vs. minor) shall be defined as a compile-time constant and documented in the hardware bring-up notes.
+The BMI160 is mounted so that one of its sensor axes aligns with the baton's minor axis. The axis mapping (BMI160 axis ↔ major / minor) is defined as a compile-time constant.
 
-#### Kubb-Checker-Hub
+#### 2.2.2 Kubb-Checker-App Host
 
-| Attribute | Value |
+| Parameter | Value |
 |-----------|-------|
-| MCU | ESP32 (variant TBD; must support simultaneous ESP-NOW + WiFi AP) |
-| Storage | NVS flash (sensor registry, configuration) |
-| Connectivity | ESP-NOW toward sensors; WiFi AP toward mobile clients |
-| Power | External supply — USB power bank or mains adapter (assumed) |
+| Platform | Android (BLE + NFC capable) |
+| BLE role | Central (up to 6 simultaneous peripheral connections) |
+| NFC role | Reader (OOB pairing) |
 
 ### 2.3 Software Architecture
 
-#### Sensor Firmware Tasks
+#### 2.3.1 Sensor Firmware Modules
 
-| Task | Priority | Description |
-|------|----------|-------------|
-| `imu_task` | High | I2C polling, BMI160 data acquisition at ≥ 400 Hz |
-| `flight_detect_task` | High | State machine: Still → Moving → Flying → Still |
-| `analysis_task` | Medium | Integrate gyro data, compute throw result when flight ends |
-| `espnow_tx_task` | Medium | Send status and throw result packets to hub |
-| `battery_task` | Low | Periodic ADC read of battery voltage → SoC estimate |
-| `serial_debug_task` | Low | Format and output structured debug info via UART |
+| Module | Description |
+|--------|-------------|
+| **IMU Driver** | BMI160 I2C driver; reads raw gyro + accelerometer at ≥ 100 Hz. |
+| **Signal Processing** | State machine (Rest / Pre-throw / In-flight / Post-impact / Shaking); gyro integration; throw analysis. |
+| **Calibration** | On-command bias/offset computation; sanity check; NVS storage. |
+| **BLE (NimBLE)** | GATT server; advertising; 4 characteristics; event queue for zero-loss Event-Characteristic. |
+| **NVS** | Persists device name, calibration parameters, thresholds. |
+| **OTA** | WiFi HTTP OTA triggered by BLE Control command (assumed); A/B partition; auto-rollback. |
+| **Serial Logging** | UART debug output with component tags and timestamps. |
 
 **Sensor Boot Sequence:**
-1. Initialize UART / serial logging; output firmware version
-2. Initialize I2C bus and BMI160; verify chip ID
-3. Run gyroscope zero-rate offset calibration (sensor at rest, ≥ 3 s)
-4. Load device name from NVS (or use MAC-derived default)
-5. Initialize ESP-NOW; register hub MAC as unicast peer
-6. Start all FreeRTOS tasks
-7. Enter normal operation (Still state)
+1. Initialize UART; log firmware version.
+2. Initialize NVS; load device name, calibration offsets, thresholds (apply defaults if empty).
+3. Log loaded NVS values including BLE MAC address and device name to serial.
+4. Initialize I2C; detect BMI160 (verify chip ID 0xD1).
+5. Apply calibration offsets.
+6. Start BLE advertising under stored device name (`kastpinne-<last4hexMAC>` if unconfigured).
+7. Enter main loop: IMU sampling → signal processing → BLE notifications.
 
-#### Hub Firmware Tasks
+#### 2.3.2 Kubb-Checker-App Architecture
 
-| Task | Priority | Description |
-|------|----------|-------------|
-| `espnow_rx_task` | High | Receive and dispatch packets from sensors |
-| `data_store_task` | Medium | Update sensor state / throw records and statistics |
-| `wifi_ap_task` | Medium | Maintain WiFi AP; manage connected clients |
-| `http_server_task` | Medium | Serve web UI and REST API endpoints |
-| `serial_debug_task` | Low | Output received data and statistics via UART |
+| Component | Description |
+|-----------|-------------|
+| **BLE Manager** | BLE central role; up to 6 simultaneous connections; scan, pair, bond, reconnect. |
+| **NFC Manager** | Reads NTAG215 OOB record; initiates BLE tap-to-pair. |
+| **Data Model (MVVM)** | Per-baton state: connection, last event, telemetry stream, status. (MVVM with Jetpack Compose — assumed.) |
+| **Front Page** | Live 6-baton grid; validity indicators; last-thrown highlight. |
+| **Settings Sub-page** | Paired baton list; shake identification indicator. |
+| **Baton Sub-sub-page** | 3D model, accelerometer bars, calibration trigger, name editing. |
+| **Persistence** | Android SharedPreferences or Room DB for pairing history (assumed). |
 
-**Hub Boot Sequence:**
-1. Initialize UART / serial logging; output firmware version
-2. Initialize NVS; load sensor registry (names keyed by MAC) and configuration
-3. Initialize WiFi in AP+STA mode (required for concurrent ESP-NOW + AP)
-4. Start WiFi Access Point
-5. Initialize ESP-NOW
-6. Start HTTP server
-7. Start all FreeRTOS tasks
-8. Enter normal operation
+#### 2.3.3 Sensor Persistence (NVS Namespace: `kubb`)
 
-**OTA Update Model:**
+| NVS Key | Type | Description | Default |
+|---------|------|-------------|---------|
+| `device_name` | String | Human-readable baton ID | `kastpinne-<MAC[8:12]>` |
+| `cal_gyro_x/y/z` | Float | Gyro axis bias offsets (°/s) | 0.0 |
+| `cal_accel_x/y/z` | Float | Accelerometer axis bias offsets (m/s²) | 0.0 |
+| `thr_throw_accel` | Float | Throw-start translational acceleration threshold (m/s²) | 15.0 |
+| `thr_throw_rot` | Float | Throw-start rotation velocity threshold (°/s) | 200.0 |
+| `thr_impact` | Float | Impact acceleration threshold (m/s²) | 20.0 |
 
-- **Sensor OTA**: Web UI trigger → Hub sends `CMD_OTA_START` via ESP-NOW → Sensor suspends ESP-NOW and connects to hub WiFi AP as STA → Sensor downloads `sensor.bin` via HTTP from hub → Sensor verifies integrity, writes to OTA partition B, reboots → On successful boot: marks B valid, reconnects via ESP-NOW
-- **Hub OTA**: Web UI trigger → Operator uploads firmware binary to hub via HTTP → Hub downloads and applies to OTA partition B, reboots
+#### 2.3.4 OTA Update Model
 
-**Persistence (NVS):**
+All sensor devices support wireless firmware updates triggered via the BLE Control-Characteristic (`OTA_START` command). Upon receiving the command (including WiFi SSID, password, and firmware URL), the sensor:
+1. Connects to the specified WiFi network.
+2. Downloads the firmware binary via HTTP.
+3. Verifies integrity (ESP-IDF checksum/signature).
+4. Writes to the inactive OTA partition (A/B dual-partition scheme).
+5. Reboots; on successful boot marks partition valid.
+6. If new firmware fails to boot, automatically rolls back to the previous partition.
 
-| Device | NVS Keys |
-|--------|---------|
-| Sensor | Device name, gyroscope calibration offsets, OTA boot partition metadata |
-| Hub | Sensor registry (MAC → name map), WiFi AP channel |
+(WiFi credentials and firmware URL are provided per OTA command via BLE — assumed.)
 
 ---
 
 ## 3. Implementation Phases
 
-### 3.1 Phase 1 — Sensor Core (Standalone)
+### 3.1 Phase 1 — BLE Connection Foundation
 
 **Scope:**
-- BMI160 I2C initialization and chip verification
-- Gyroscope calibration at boot; NVS persistence of offsets
-- IMU data acquisition loop (gyro + accel)
-- Flight detection state machine (Still / Moving / Flying)
-- Gyro integration and throw result computation (rotation minor, rotation major, ToF, max accel, validity)
-- Battery SoC monitoring
-- Serial debug output for all state transitions and results
-- No ESP-NOW in this phase; hub connection deferred to Phase 2
+- Sensor: BLE advertising, GATT server with Telemetry-Characteristic only. Data source is demo-generated (simulated single-axis rotation + constant acceleration in a random direction). No real IMU reads.
+- App: BLE scan, NFC tap-to-pair, connect to one baton; display raw Telemetry-Characteristic values as text.
 
 **Deliverables:**
-- Sensor firmware running on ESP32-C3 with BMI160 attached via I2C
-- Serial output showing: boot calibration result, state transitions, throw result fields, battery SoC
+- Sensor firmware v0.1: BLE advertising + demo telemetry stream.
+- Android app v0.1: BLE scan/pair/connect + raw telemetry text display.
 
 **Exit Criteria:**
-- Throw start detected within 100 ms of actual throw (manual validation)
-- Landing detected within 200 ms of actual impact
-- Rotation around minor axis within ± 15° of reference measurement (protractor rig or video analysis)
-- Battery SoC (%) logged periodically on serial; value plausible when battery is charged
-- State machine transitions correctly for: rest, slow pick-up, throw, hard impact
-- No spurious "Flying" state when baton is slowly moved or set down
+- Sensor visible as `kastpinne-xxxx` in nRF Connect after power-on.
+- BLE MAC logged to serial on boot.
+- App connects via NFC tap-to-pair; receives continuous telemetry at ~10 Hz.
+- Sensor resumes advertising after disconnect.
 
-**Dependencies:** None
+**Dependencies:**
+- NTAG215 tag pre-written with BLE MAC (manual setup step).
 
 ---
 
-### 3.2 Phase 2 — Hub Core (Without Web Interface)
+### 3.2 Phase 2 — Real Gyro Data
 
 **Scope:**
-- Sensor firmware updated: ESP-NOW TX (status packets, throw result packets)
-- Hub firmware: ESP-NOW RX (star topology, accept all sensors)
-- Sensor registry (MAC → name) on hub
-- Game statistics computation per sensor
-- Hub serial debug output for all received data and statistics
-- Sensor name assignment and calibration command relay (via hub serial commands as temporary workaround)
+- Sensor: BMI160 I2C driver integration. Replace demo data in Telemetry-Characteristic with live IMU readings. No processing or detection yet — raw calibrated sensor output only.
 
 **Deliverables:**
-- Updated sensor firmware with ESP-NOW TX
-- Hub firmware with ESP-NOW RX and statistics engine
-- Hub serial shows: all received throw events, updated statistics per sensor
-- ≥ 2 sensors communicating with hub simultaneously (full 6-sensor test at phase end)
+- Sensor firmware v0.2: Live IMU data via Telemetry-Characteristic.
 
 **Exit Criteria:**
-- Hub receives throw results from all active sensors within 2 s of landing detection
-- Game statistics correct: total throws, max/min/avg rotation (minor and major), max/min/avg ToF, max/min/avg max accel
-- No data loss when ≥ 2 sensors transmit simultaneously
-- Sensor name assigned via hub serial persists in hub NVS after hub reboot
+- Stationary baton shows gyro ≈ 0 °/s and accel ≈ 9.8 m/s² on gravity axis.
+- Rotating the baton causes corresponding gyro axis to respond.
+- No I2C errors in serial log under normal operation.
 
-**Dependencies:** Phase 1 complete
+**Dependencies:**
+- Phase 1 complete. BMI160 wired and I2C address confirmed.
 
 ---
 
-### 3.3 Phase 3 — Web Interface
+### 3.3 Phase 3 — Calibration & Settings UI
 
 **Scope:**
-- Hub embedded HTTP server fully operational
-- Responsive web interface (SPA) served from hub
-- Per-sensor cards: state, last throw data, validity highlight, battery SoC
-- Game statistics table per sensor
-- Sensor management controls: name assignment, calibration trigger
-- Statistics reset button
-- OTA update flow (sensor and hub) accessible from web UI
+- Sensor: Calibration routine via Control-Characteristic; NVS persistence for calibration data, device name, thresholds.
+- App: Settings sub-page (single baton entry), Baton sub-sub-page with 3D model, accelerometer bar graphs, calibration button; baton name editing.
 
 **Deliverables:**
-- Web interface accessible at `http://192.168.4.1` from mobile browser on hub AP
-- All management functions operational from a smartphone browser
-- Successful OTA update verified for at least one sensor and the hub
+- Sensor firmware v0.3: Calibration + full NVS persistence.
+- App v0.3: Settings UI, 3D visualization, calibration workflow.
 
 **Exit Criteria:**
-- Interface loads within 3 s on mobile browser connected to hub AP
-- Sensor data updates within 1 s of sensor transmission (no page reload required)
-- Sensor name change persists across hub reboot
-- Statistics reset clears all counters
-- OTA flow completes for one sensor and for hub
-- Interface usable on iOS Safari and Android Chrome at ≥ 360 px screen width
+- Calibration completes from app; calibrated offsets logged to serial.
+- Calibration and device name survive sensor reboot.
+- 3D baton model rotates in sync with physical baton movement.
+- Sanity-check error returned to app when baton is moving during calibration.
 
-**Dependencies:** Phase 2 complete
-
----
-
-## 4. Functional Requirements
-
-### 4.1 Functional Requirements (FR)
-
-#### FR-1: IMU Data Acquisition
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-1.1 | Must | The sensor shall initialize the BMI160 via I2C on boot and verify the chip ID (expected: 0xD1). |
-| FR-1.2 | Must | The sensor shall sample the BMI160 gyroscope at ≥ 400 Hz during active operation. |
-| FR-1.3 | Must | The sensor shall sample the BMI160 accelerometer at ≥ 100 Hz during active operation. |
-| FR-1.4 | Must | The sensor shall configure the BMI160 gyroscope full-scale range to ≥ ±2000 °/s. |
-| FR-1.5 | Must | The sensor shall configure the BMI160 accelerometer full-scale range to ≥ ±16 g. |
-| FR-1.6 | Must | The sensor shall perform gyroscope zero-rate offset calibration at boot with the sensor held stationary for ≥ 3 s. |
-| FR-1.7 | Must | The sensor shall apply calibration offsets to all gyroscope readings in real time. |
-| FR-1.8 | Must | The sensor shall persist calibration offsets in NVS and apply them on subsequent boots without re-running calibration. |
-| FR-1.9 | Must | The sensor shall support manual calibration re-triggering via a command received from the hub. |
-
-#### FR-2: Flight & Throw Detection
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-2.1 | Must | The sensor shall implement a state machine with states: **Still**, **Moving**, **Flying**. |
-| FR-2.2 | Must | Transition Still → Moving shall be triggered when gyroscope magnitude exceeds a configurable threshold (default: 50 °/s) sustained for ≥ 20 ms. |
-| FR-2.3 | Must | Transition Moving → Flying (throw detected) shall be triggered when combined gyroscope magnitude and accelerometer deviation from 1 g indicate a ballistic throw pattern. |
-| FR-2.4 | Must | Transition Flying → Still (landing detected) shall be triggered by a high-G impact event on the accelerometer exceeding a configurable threshold (default: 4 g peak). |
-| FR-2.5 | Should | The sensor shall apply debounce and hysteresis to suppress spurious state transitions caused by slow handling or resting movements. |
-| FR-2.6 | Should | The sensor shall buffer the last 100 ms of IMU data continuously (circular pre-buffer) to capture the pre-throw context. |
-
-#### FR-3: Throw Analysis
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-3.1 | Must | Upon landing detection, the sensor shall integrate the gyroscope data over the flight period to compute total rotation around the minor axis (°). |
-| FR-3.2 | Must | Upon landing detection, the sensor shall integrate the gyroscope data over the flight period to compute total rotation around the major axis (°). |
-| FR-3.3 | Must | The sensor shall compute time-of-flight as the elapsed time between throw start detection and landing detection (ms). |
-| FR-3.4 | Must | The sensor shall record the maximum longitudinal acceleration (along the major axis) observed during flight (g). |
-| FR-3.5 | Must | The sensor shall determine throw validity: a throw is valid if and only if the rotation around the minor axis during flight is ≥ 360°. |
-| FR-3.6 | Must | The sensor shall package the throw result as a structured record and transmit it to the hub via ESP-NOW immediately after analysis completes. |
-
-#### FR-4: Sensor Communication (ESP-NOW)
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-4.1 | Must | The sensor shall communicate with the hub using ESP-NOW in station mode. |
-| FR-4.2 | Must | The sensor shall send a periodic STATUS packet to the hub every 1 s containing: sensor MAC, current name, current state, and battery SoC. |
-| FR-4.3 | Must | The sensor shall send a THROW_RESULT packet to the hub immediately after throw analysis completes. |
-| FR-4.4 | Must | The THROW_RESULT packet shall contain: sensor MAC, throw start uptime (ms), throw end uptime (ms), rotation_minor (°), rotation_major (°), max_longitudinal_accel (g), is_valid (bool), sequence number. |
-| FR-4.5 | Should | The sensor shall retransmit the THROW_RESULT packet if no ESP-NOW acknowledgment is received within 500 ms (up to 3 retries). |
-| FR-4.6 | Must | The sensor shall receive and process commands from the hub: CMD_SET_NAME, CMD_CALIBRATE, CMD_OTA_START. |
-
-#### FR-5: Sensor Configuration & Identification
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-5.1 | Must | Each sensor shall have a unique user-assigned device name (text string, max 15 characters + null terminator). |
-| FR-5.2 | Must | The sensor shall persist its name in NVS across reboots. |
-| FR-5.3 | Must | If no name has been assigned, the sensor shall use a MAC-derived default name (e.g., `Baton-A1B2`). |
-| FR-5.4 | Must | The sensor name shall be assignable via the hub web interface. |
-| FR-5.5 | Must | The sensor shall include its current name in all STATUS packets sent to the hub. |
-
-#### FR-6: Battery Monitoring
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-6.1 | Must | The sensor shall measure the LiIon 1S cell voltage via the ESP32-C3 ADC at intervals ≤ 60 s. |
-| FR-6.2 | Must | The sensor shall convert cell voltage to a state-of-charge estimate (%) using a voltage-SoC lookup table for LiIon 1S cells (3.0 V = 0 %, 4.2 V = 100 %). |
-| FR-6.3 | Must | The sensor shall include the current SoC in all STATUS packets sent to the hub. |
-| FR-6.4 | Should | The sensor shall log a warning via serial when SoC drops below 20 %. |
-
-#### FR-7: Hub — ESP-NOW Reception & Data Storage
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-7.1 | Must | The hub shall act as the central node of an ESP-NOW star topology and receive packets from all registered sensors. |
-| FR-7.2 | Must | The hub shall maintain a sensor registry: a list of all sensors that have communicated, keyed by MAC address, storing user-assigned name and last-seen timestamp. |
-| FR-7.3 | Must | The hub shall store the most recent STATUS (state, SoC) and last THROW_RESULT for each registered sensor. |
-| FR-7.4 | Must | The hub shall compute and update game statistics per sensor upon receiving each THROW_RESULT. |
-| FR-7.5 | Must | Game statistics per sensor shall include: total throw count, valid throw count, max/min/avg rotation around minor axis (°), max/min/avg rotation around major axis (°), max/min/avg time-of-flight (ms), max/min/avg maximum longitudinal acceleration (g). |
-| FR-7.6 | Must | The hub shall accept a statistics reset command and clear all per-sensor statistics. |
-| FR-7.7 | Must | The hub shall send commands to sensors via ESP-NOW: CMD_SET_NAME, CMD_CALIBRATE, CMD_OTA_START. |
-| FR-7.8 | Should | The hub shall output all received sensor data and computed statistics via serial debug interface. |
-
-#### FR-8: Hub — WiFi Access Point & HTTP Server
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-8.1 | Must | The hub shall start a WiFi Access Point on boot with SSID `KubbChecker-{HUB_MAC_LAST_4}`. |
-| FR-8.2 | Must | The hub shall assign IP addresses to AP clients via DHCP; hub IP shall be 192.168.4.1. |
-| FR-8.3 | Must | The hub shall run an embedded HTTP server on port 80 accessible to all WiFi AP clients. |
-| FR-8.4 | Must | The hub shall serve the web interface as a self-contained page (HTML/CSS/JS) from its HTTP server. |
-| FR-8.5 | Should | The hub HTTP server shall support ≥ 3 simultaneous client connections. |
-| FR-8.6 | Should | The hub shall push sensor data updates to web clients at intervals ≤ 1 s (polling or WebSocket). |
-
-#### FR-9: Web Interface — Display
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-9.1 | Must | The web interface shall display one card per registered sensor showing: sensor name, current state (Still / Moving / Flying), last throw rotation around minor axis (°), last throw rotation around major axis (°), last throw time-of-flight (ms), last throw max longitudinal acceleration (g), last throw validity (Valid / Invalid), and battery SoC (%). |
-| FR-9.2 | Must | The web interface shall visually distinguish valid throws (green) from invalid throws (red). |
-| FR-9.3 | Must | The web interface shall display game statistics per sensor: total throws, valid throw count, max/min/avg rotation minor (°), max/min/avg rotation major (°), max/min/avg ToF (ms), max/min/avg max accel (g). |
-| FR-9.4 | Must | The web interface shall display battery SoC for each registered sensor. |
-| FR-9.5 | Should | The web interface shall update sensor data without requiring a page reload. |
-| FR-9.6 | Should | The web interface shall be responsive and usable on a smartphone screen of ≥ 360 px width. |
-
-#### FR-10: Web Interface — Control
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-10.1 | Must | The web interface shall provide a text input and submit control to assign a name to each sensor. |
-| FR-10.2 | Must | The web interface shall provide a button to trigger gyroscope calibration for each sensor. |
-| FR-10.3 | Must | The web interface shall provide a button to reset all game statistics. |
-| FR-10.4 | Must | The web interface shall provide OTA update controls: upload firmware and trigger update for each sensor and for the hub. |
-
-#### FR-11: OTA Firmware Updates
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-11.1 | Must | All devices (sensors and hub) shall support OTA firmware updates without physical access. |
-| FR-11.2 | Must | All devices shall use A/B OTA partition scheme to enable automatic rollback on boot failure. |
-| FR-11.3 | Must | All devices shall verify firmware integrity (checksum / ESP-IDF signature) before applying an update. |
-| FR-11.4 | Must | All devices shall rollback to the previous firmware partition on boot failure after an OTA update. |
-| FR-11.5 | Must | Sensor OTA shall be initiated from the web interface; the sensor shall not require a USB connection. |
-| FR-11.6 | Must | During sensor OTA, the sensor shall temporarily connect to the hub's WiFi AP as STA and download firmware via HTTP from the hub (`http://192.168.4.1/firmware/sensor.bin`). |
-| FR-11.7 | Should | OTA progress (download %, verification, apply) shall be visible in the serial debug output and in the web interface. |
-| FR-11.8 | Should | All devices shall report their running firmware version in the web interface and serial debug output. |
-
-#### FR-12: Serial Debug Output
-
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| FR-12.1 | Must | The sensor shall output all state transitions, throw events, and throw results via the UART serial interface. |
-| FR-12.2 | Must | The sensor shall output IMU calibration offsets and calibration status at boot via serial. |
-| FR-12.3 | Must | The sensor shall output battery SoC readings periodically via serial. |
-| FR-12.4 | Must | The hub shall output all received sensor data and computed statistics via serial. |
-| FR-12.5 | Should | All serial log messages shall include a timestamp and a component tag (e.g., `[IMU]`, `[ESPNOW]`, `[FLIGHT]`). |
+**Dependencies:**
+- Phase 2 complete.
 
 ---
 
-### 4.2 Non-Functional Requirements (NFR)
+### 3.4 Phase 4 — Throw Detection & Event Characteristic
 
-| ID | Priority | Requirement |
-|----|----------|-------------|
-| NFR-1.1 | Must | Rotation measurement around the minor axis shall have absolute error ≤ 15° for throws with rotation between 90° and 1080° at angular rates up to 1800 °/s. |
-| NFR-1.2 | Must | Throw start detection shall occur within 100 ms of the baton leaving the thrower's hand. |
-| NFR-1.3 | Must | Landing detection shall occur within 200 ms of the physical impact event. |
-| NFR-2.1 | Must | The system shall support ≥ 6 simultaneous sensor nodes communicating with a single hub without data loss. |
-| NFR-2.2 | Should | ESP-NOW throw result delivery from sensor to hub shall complete within 2 s of landing detection. |
-| NFR-2.3 | Should | Web interface sensor data shall refresh within 1 s of the hub receiving new data. |
-| NFR-3.1 | Should | The sensor shall operate for ≥ 3 hours continuously on a single battery charge under normal game usage. |
-| NFR-3.2 | Should | The sensor shall enter reduced-power idle mode in the Still state to extend battery life. |
-| NFR-4.1 | Should | The hub HTTP server shall support ≥ 3 simultaneous browser clients without perceptible degradation. |
-| NFR-5.1 | Must | The sensor shall independently detect and record a second throw occurring within 5 s of the previous throw landing. |
-| NFR-5.2 | Should | The hub shall not lose throw records when two sensors transmit simultaneously. |
+**Scope:**
+- Sensor: Throw detection algorithm (throw-start, flight phase, impact). Rotation axis analysis (vertical vs. helicopter). Event computation (rotation, ToF, height/distance estimates). Event-Characteristic GATT implementation; no events may be lost.
+- App: Front page updated to display Event-Characteristic data; red/green validity indicators for both criteria; highlight of last-thrown baton.
+
+**Deliverables:**
+- Sensor firmware v0.4: Throw detection + Event-Characteristic.
+- App v0.4: Front page with event display and validity indicators.
+
+**Exit Criteria:**
+- 10 test throws (mixed valid/invalid) classified correctly ≥ 90%.
+- Helicopter throws classified as invalid on rotation-axis criterion.
+- 20 consecutive throws arrive at app with no counter gaps (no event loss).
+- Last-thrown baton area highlighted on front page.
+
+**Dependencies:**
+- Phase 3 complete; calibration applied.
 
 ---
 
-### 4.3 Constraints
+### 3.5 Phase 5 — Status Characteristic & Feature Completeness
+
+**Scope:**
+- Sensor: Status-Characteristic (battery %, uptime, calibration state, firmware version); shake detection; remaining control commands (START, STOP, SET_THRESHOLD, OTA_START, FACTORY_RESET).
+- App: Status display in baton sub-sub-page.
+
+**Deliverables:**
+- Sensor firmware v0.5: Feature-complete.
+- App v0.5: Full baton sub-sub-page including status.
+
+**Exit Criteria:**
+- Battery percentage displayed and plausible.
+- Uptime increments continuously.
+- Firmware version matches build tag.
+- Shake detection lights up baton indicator in settings sub-page.
+- OTA update succeeds; auto-rollback restores previous firmware on bad update.
+
+**Dependencies:**
+- Phase 4 complete. ADC battery circuit available on hardware.
+
+---
+
+### 3.6 Phase 6 — Multi-Baton Support
+
+**Scope:**
+- App: Full support for 6 simultaneous BLE connections. Front page shows 6 baton areas. Settings sub-page lists all batons. All per-baton features work independently.
+- Sensor firmware: No changes expected; verify each baton behaves identically.
+
+**Deliverables:**
+- App v1.0: Full multi-baton support (production-ready).
+
+**Exit Criteria:**
+- 6 batons connected simultaneously; all telemetry and event streams active.
+- Throws from each baton correctly attributed to its area.
+- App responsive with 6 active BLE connections (no perceptible UI lag).
+- No BLE stability issues with 6 peripherals active.
+
+**Dependencies:**
+- Phase 5 complete. 6 assembled, charged, and calibrated sensor units.
+
+---
+
+## 4. Functional & Non-Functional Requirements
+
+### 4.1 Sensor — BLE Communication
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-1.1 | Must | The sensor shall advertise via BLE using the stored device name (default: `kastpinne-<last4hexMAC>`). |
+| FR-1.2 | Must | The sensor shall accept BLE connections and resume advertising after disconnection. |
+| FR-1.3 | Must | The sensor shall implement a custom GATT service with Event-, Telemetry-, Status-, and Control-Characteristics as specified in Section 6. |
+| FR-1.4 | Must | The sensor shall deliver all Event-Characteristic notifications with zero data loss; events shall be queued if the client is temporarily unavailable. |
+| FR-1.5 | Must | The sensor shall transmit Telemetry-Characteristic notifications at approximately 10 Hz; sample loss is acceptable. |
+| FR-1.6 | Should | The sensor shall transmit Status-Characteristic notifications when values change and respond to READ requests. |
+| FR-1.7 | Must | The sensor shall process all Control-Characteristic WRITE commands defined in Section 6.4. |
+| FR-1.8 | Must | The sensor shall log its BLE MAC address and device name to the serial console at boot. |
+| FR-1.9 | Should | The sensor shall log BLE connection and disconnection events to serial. |
+
+### 4.2 Sensor — IMU Data Acquisition
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-2.1 | Must | The sensor shall initialize the BMI160 via I2C on boot and verify the chip ID (expected: 0xD1). |
+| FR-2.2 | Must | The sensor shall sample the BMI160 gyroscope and accelerometer at ≥ 100 Hz during active operation. |
+| FR-2.3 | Must | The sensor shall configure the gyroscope full-scale range to ≥ ±2000 °/s and the accelerometer to ≥ ±16 g. |
+| FR-2.4 | Must | The sensor shall apply stored calibration offsets to all IMU readings before processing. |
+| FR-2.5 | Must | The sensor shall detect and log I2C communication errors. |
+
+### 4.3 Sensor — Gyroscope Calibration
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-3.1 | Must | The sensor shall initiate calibration upon receiving the `CALIBRATE` command via the Control-Characteristic. |
+| FR-3.2 | Must | Before calibrating, the sensor shall perform a sanity check: if IMU readings indicate the baton is not at rest, return an error code to the app and abort. |
+| FR-3.3 | Must | The sensor shall average IMU bias measurements over a minimum of 2 s to compute calibration parameters. |
+| FR-3.4 | Must | The sensor shall store calibration parameters in NVS; they shall survive reboots and power cycles. |
+| FR-3.5 | Must | The sensor shall return a success or failure response via the Status-Characteristic upon calibration completion. |
+
+### 4.4 Sensor — Throw Detection
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-4.1 | Must | The sensor shall detect the start of a throw when translational and rotational acceleration exceed configurable thresholds. |
+| FR-4.2 | Must | The sensor shall identify the free-flight phase as the period when translational acceleration is within the gravitational band (8.0–10.5 m/s²). |
+| FR-4.3 | Must | The sensor shall detect the end of the flight phase (impact) when translational acceleration exceeds the configurable impact threshold. |
+| FR-4.4 | Must | The sensor shall compute total rotation around the major axis (°) during the flight phase. |
+| FR-4.5 | Must | The sensor shall compute total rotation around the minor axis (°) during the flight phase. |
+| FR-4.6 | Must | The sensor shall determine the orientation of the minor rotational axis during flight: if the axis was approximately horizontal (within ±45° of the horizon plane), classify as valid vertical rotation; if pointing predominantly up or down, classify as invalid helicopter throw. |
+| FR-4.7 | Must | The sensor shall compute the time-of-flight (s) from throw-start detection to impact detection. |
+| FR-4.8 | Should | The sensor shall estimate the peak flight height (m) and horizontal distance (m) by double-integrating translational acceleration during the flight phase. |
+| FR-4.9 | Must | The sensor shall transmit an Event-Characteristic notification for each detected throw; no events shall be dropped. |
+
+### 4.5 Sensor — Shake Detection
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-5.1 | Must | The sensor shall detect rapid shaking motion (short-duration high-frequency acceleration pattern) distinct from a throw. |
+| FR-5.2 | Must | The sensor shall include a `is_shaking` flag in the Telemetry-Characteristic payload to allow the app to identify the shaken baton. |
+
+### 4.6 Sensor — NVS Persistence
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-6.1 | Must | The sensor shall persist the device name in NVS; the name shall survive reboots and power cycles. |
+| FR-6.2 | Must | The sensor shall persist calibration parameters in NVS. |
+| FR-6.3 | Must | The sensor shall persist throw-detection threshold values in NVS. |
+| FR-6.4 | Must | The sensor shall apply default values for all NVS parameters when NVS is empty or uninitialized. |
+| FR-6.5 | Should | The sensor shall log loaded NVS configuration values at startup. |
+
+### 4.7 Sensor — OTA Firmware Update
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-7.1 | Must | The sensor shall support OTA firmware updates triggered via the BLE Control-Characteristic `OTA_START` command. |
+| FR-7.2 | Must | The sensor shall verify firmware integrity (checksum/signature) before applying an OTA update. |
+| FR-7.3 | Must | The sensor shall use dual OTA partitions (A/B scheme) to enable automatic rollback on boot failure. |
+| FR-7.4 | Must | The sensor shall automatically roll back to the previous firmware if the new firmware fails to boot. |
+| FR-7.5 | Should | The sensor shall log OTA progress (download %, verification, apply) to the serial console. |
+
+### 4.8 Sensor — NFC Tap-to-Pair
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-8.1 | Must | The sensor shall log its BLE MAC address to serial at boot to enable programming of the NTAG215 NFC tag. |
+| FR-8.2 | Must | Each baton's NTAG215 NFC tag shall contain OOB BLE pairing data (BLE MAC address and pairing key) enabling tap-to-pair from the app. |
+
+### 4.9 Sensor — Serial Logging
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-9.1 | Must | The sensor shall log BLE MAC, device name, and firmware version at startup. |
+| FR-9.2 | Must | The sensor shall log I2C errors, BLE connection events, calibration results, and throw detection events. |
+| FR-9.3 | Should | The sensor shall log OTA progress and results. |
+| FR-9.4 | Should | All serial messages shall include a timestamp and a component tag (e.g., `[BLE]`, `[IMU]`, `[FLIGHT]`, `[CAL]`). |
+
+### 4.10 App — BLE Central Management
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-10.1 | Must | The app shall support simultaneous BLE connections to up to 6 Kubb-Checker-Sensor devices. |
+| FR-10.2 | Must | The app shall initiate BLE pairing via NFC tap-to-pair (OOB pairing using NTAG215 data). |
+| FR-10.3 | Must | The app shall subscribe to Event-, Telemetry-, and Status-Characteristic notifications upon connection. |
+| FR-10.4 | Must | The app shall send commands to the sensor via the Control-Characteristic WRITE operation. |
+| FR-10.5 | Should | The app shall automatically reconnect to previously paired batons when they come into BLE range. |
+
+### 4.11 App — Front Page
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-11.1 | Must | The front page shall display the title "Kubb Checker" centered at the top. |
+| FR-11.2 | Must | The front page shall show six equal framed areas, one per baton slot; unused slots shall appear empty. |
+| FR-11.3 | Must | Each connected baton area shall display the baton ID, last throw statistics summary, and a motion-state indicator (moving / resting). |
+| FR-11.4 | Must | Each baton area shall show two red/green validity indicators: (1) vertical rotation (not helicopter), (2) at least one full rotation (≥ 360°). |
+| FR-11.5 | Must | The baton area of the most recently thrown baton shall be highlighted with a distinct frame. |
+| FR-11.6 | Must | A settings button (gear icon) shall be displayed in the upper-right corner of the front page. |
+
+### 4.12 App — Settings Sub-Page
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-12.1 | Must | The settings sub-page shall list all paired batons showing BLE MAC address, device name, and connection status. |
+| FR-12.2 | Must | Each baton entry shall display a shake/rapid-movement indicator to allow physical identification of a specific baton. |
+| FR-12.3 | Must | Selecting a baton entry shall navigate to that baton's sub-sub-page. |
+
+### 4.13 App — Baton Sub-Sub-Page
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-13.1 | Must | The baton sub-sub-page shall display the baton ID at the top. |
+| FR-13.2 | Must | The page shall render a 3D model of a wooden cylinder with slightly rounded edges that rotates in real time according to Telemetry-Characteristic gyro readings. |
+| FR-13.3 | Must | Three bar graphs shall display translational acceleration in X, Y, and Z axes on a scale of 0–100 m/s². |
+| FR-13.4 | Must | A "Calibrate" button shall trigger the gyroscope calibration procedure on the connected baton. |
+| FR-13.5 | Must | The app shall display step-by-step calibration guidance (instruction to lay baton flat and still) and show success or error feedback. |
+
+### 4.14 App — Baton Name Editing
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| FR-14.1 | Must | An "Edit" button next to the baton ID shall enable inline editing of the device name. |
+| FR-14.2 | Must | After editing is confirmed, the app shall write the new name to the baton via the Control-Characteristic `SET_NAME` command. |
+| FR-14.3 | Must | The baton shall persist the new name in NVS and use it in BLE advertising after the next reboot. |
+
+### 4.15 Non-Functional Requirements
+
+| ID | Priority | Requirement |
+|----|----------|-------------|
+| NFR-1.1 | Must | The IMU shall be sampled at ≥ 100 Hz to achieve sufficient temporal resolution for throw detection. |
+| NFR-1.2 | Must | Throw validity classification shall achieve ≥ 90% accuracy across a defined set of valid and invalid reference throws. |
+| NFR-1.3 | Must | Event-Characteristic notifications shall be delivered with zero data loss; events shall be queued when BLE is temporarily unavailable. |
+| NFR-1.4 | Should | BLE telemetry notification latency shall be ≤ 100 ms end-to-end. |
+| NFR-1.5 | Must | The sensor electronics and battery shall physically fit inside the baton housing (≤ 300 mm × 40 mm diameter). |
+| NFR-1.6 | Should | The sensor shall survive the mechanical shock of a typical Kubb throw and impact (estimated peak acceleration ≥ 50 m/s² — assumed). |
+| NFR-2.1 | Must | All 6 baton sensors shall remain operational throughout a full game session (assumed ≥ 2 hours). |
+| NFR-2.2 | Should | The app shall remain responsive (no perceptible UI lag) with 6 simultaneous active BLE connections and continuous telemetry. |
+| NFR-3.1 | Should | Calibration parameters and device names shall persist through ≥ 1000 NVS write cycles without corruption. |
+| NFR-3.2 | Must | OTA firmware integrity shall be verified before flashing; corrupt or mismatched binaries shall be rejected. |
+| NFR-4.1 | Should | The 3D baton model in the app shall render at ≥ 30 fps when telemetry is active. |
+| NFR-5.1 | Should | The BLE MAC address shall be stable (non-randomized) across reboots to ensure consistent NFC tap-to-pair. |
+
+### 4.16 Constraints
 
 | ID | Constraint |
 |----|-----------|
 | CON-1 | Sensor firmware shall target ESP-IDF (or Arduino framework on ESP-IDF) for the ESP32-C3. |
-| CON-2 | Hub firmware shall target ESP-IDF (or Arduino framework on ESP-IDF) for the ESP32. |
-| CON-3 | Sensor PCB and LiIon 1S battery shall fit within a baton of approximately 300 mm × 40 mm diameter. |
-| CON-4 | The hub shall not require internet connectivity for any operational function. |
-| CON-5 | The ESP-NOW protocol limits unicast payload to 250 bytes per frame. All packet structures shall remain within this limit. |
-| CON-6 | The BMI160 I2C address is 0x68 (SDO = GND) unless hardware requires 0x69 (SDO = VDD). |
-| CON-7 | OTA partition scheme requires ≥ 2 MB flash on each device; ESP32-C3 and ESP32 modules shall be selected accordingly. |
-| CON-8 | ESP-NOW and WiFi AP on the hub must operate on the same 2.4 GHz channel. |
+| CON-2 | App platform is Android only; minimum API level TBD (assumed API 26 / Android 8.0). |
+| CON-3 | Sensor PCB and LiIon 1S battery shall fit within baton dimensions (≤ 300 mm × 40 mm diameter). |
+| CON-4 | Throw validity criteria (≥ 360° minor-axis rotation, vertical rotation axis) are fixed by Kubb rules and are not end-user configurable. |
+| CON-5 | BLE MAC address must be public and stable (disable address randomization in ESP-IDF BLE config). |
+| CON-6 | BMI160 I2C address is 0x68 (SDO = GND) unless hardware requires 0x69 (SDO = VDD). |
+| CON-7 | OTA partition scheme requires ≥ 2 MB flash on each ESP32-C3 module. |
 
 ---
 
 ## 5. Risks, Assumptions & Dependencies
 
-### 5.1 Risk Register
-
-| ID | Risk | Likelihood | Impact | Mitigation |
-|----|------|-----------|--------|-----------|
-| R-1 | Gyro integration drift causes rotation error > 15° | Medium | High | Sample at ≥ 400 Hz; apply calibration offsets; limit integration to confirmed flight window only |
-| R-2 | False throw detection from rough handling or setting down baton | Medium | Medium | Implement debounce and hysteresis; tune thresholds during field testing |
-| R-3 | ESP-NOW range insufficient across a full Kubb field (~10 m) | Low | High | Test range in open field early; 2.4 GHz ESP-NOW with +20 dBm TX power exceeds 10 m typical range |
-| R-4 | Concurrent ESP-NOW and WiFi AP on hub causes packet loss or interference | Low | High | Use identical channel for both; validate during Phase 2 multi-sensor test |
-| R-5 | Sensor hardware (PCB + LiIon) does not fit inside baton | Medium | High | Validate physical dimensions before PCB layout; custom PCB may be required |
-| R-6 | Battery SoC voltage estimate is inaccurate under load | Medium | Low | Acceptable for game use; note in documentation; improve with coulomb counting if needed |
-| R-7 | Hub has no absolute time reference (no NTP, no RTC) | High | Low | Hub uses uptime-relative timestamps for all throw events; user may set wall-clock time via web UI if needed |
-| R-8 | Sensor is non-operational during OTA download | Medium | Medium | Document the OTA window; do not trigger during active game play |
-
-### 5.2 Assumptions
-
-| ID | Assumption |
-|----|-----------|
-| A-1 | The BMI160 is rigidly fixed inside the baton with one gyroscope axis aligned to the baton's minor axis. The axis mapping (BMI160 axis ↔ baton minor / major) is defined at compile time. |
-| A-2 | The hub's ESP32 supports simultaneous ESP-NOW and WiFi AP operation on the same 2.4 GHz channel (standard ESP-IDF capability). |
-| A-3 | Throw timestamps are hub-uptime-relative at the time of ESP-NOW packet receipt, not absolute wall-clock time. (assumed) |
-| A-4 | The hub is powered by an external supply and has no battery constraints. (assumed) |
-| A-5 | The hub WiFi AP operates with no password (open authentication) for ease of use at the game site. (assumed) |
-| A-6 | Game statistics are stored in hub RAM and are lost on hub power-cycle; NVS persistence of statistics is deferred. (assumed) |
-| A-7 | Sensor firmware and hub firmware are separate build projects sharing a common protocol header. |
-| A-8 | Maximum throw angular velocity is ≤ 1800 °/s; the ±2000 °/s gyro range provides sufficient headroom. (assumed) |
-| A-9 | A BMI160 I2C driver is available (Bosch BSX or community library); if not, a minimal register-level driver will be written. |
-
-### 5.3 External Dependencies
-
-| Dependency | Owner | Notes |
-|-----------|-------|-------|
-| BMI160 I2C driver / library | Third-party or custom | Verify availability; fallback to register-level driver using `Documentation/bst-bmi160-ds000.pdf` |
-| ESP-IDF ESP-NOW API | Espressif | Use ESP-IDF LTS; API is stable |
-| ESP32-C3 / ESP32 toolchain | Espressif | ESP-IDF v5.x recommended |
-| LiIon 1S charging circuit | Hardware design | Charging is out of firmware scope; battery monitoring reads cell voltage only |
+| # | Risk / Assumption | Type | Likelihood | Impact | Mitigation |
+|---|-------------------|------|------------|--------|-----------|
+| R-1 | Double integration of acceleration for height/distance estimation produces unacceptable drift | Technical risk | High | Low | Report height/distance as best-effort only; mark in UI. Fall back to time-of-flight only if drift is unacceptable. FR-4.8 is Should-priority. |
+| R-2 | Android device may not support 6 simultaneous BLE central connections | Technical risk | Medium | High | Test on target hardware early in Phase 6. Document minimum Android version and BLE capability. Provide graceful degradation for fewer simultaneous connections. |
+| R-3 | Mechanical shock from throws and impacts may damage sensor PCB or loosen I2C connections | Physical risk | Medium | High | Use conformal coating and secure mounting. Validate with 50-throw soak test (AT-004). |
+| R-4 | Battery life may be insufficient for a 2-hour session | Technical risk | Medium | Medium | Implement IMU duty-cycling and BLE connection-interval optimization between throws. |
+| R-5 | Throw detection thresholds require per-player or per-field tuning | Design assumption | High | Low | Expose all thresholds as configurable NVS parameters adjustable via BLE Control command. |
+| R-6 | Rotation axis orientation algorithm may misclassify borderline throws | Algorithm risk | Medium | Medium | Define clear axis-angle threshold (±45° from horizon). Validate on ≥ 30 reference throws. |
+| A-1 | OTA update uses WiFi HTTP download triggered via BLE Control command; WiFi credentials provided per command. (assumed) | Assumption | — | — | Confirm OTA mechanism before Phase 5. Alternative: BLE DFU via NimBLE MCUboot. |
+| A-2 | Battery type is LiIon 1S with integrated charging circuit; level measured via ESP32-C3 ADC. (assumed) | Assumption | — | — | Confirm hardware design before Phase 5. |
+| A-3 | IMU sampling at 100 Hz is sufficient for accurate rotation detection at typical throw speeds. (assumed) | Assumption | — | — | Verify with real throw data in Phase 4. |
+| A-4 | App uses MVVM architecture with Jetpack Compose for Android UI. (assumed) | Assumption | — | — | Confirm framework before Phase 1 app development. |
+| A-5 | BLE MAC address on ESP32-C3 is public and stable across reboots (address randomization disabled). (assumed) | Assumption | — | — | Verify in ESP-IDF BLE configuration before Phase 1. |
+| A-6 | Throw timestamps are milliseconds since boot; no RTC or absolute wall-clock time available. (assumed) | Assumption | — | — | Document limitation; add RTC if absolute time is later required. |
+| D-1 | NTAG215 tags must be programmed with BLE MAC before first pairing (manual setup step) | Dependency | — | — | Document tag-writing procedure in operational procedures. |
+| D-2 | 6 fully assembled, battery-equipped sensor units required for Phase 6 testing | Dependency | — | — | Track hardware assembly timeline. |
 
 ---
 
 ## 6. Interface Specifications
 
-### 6.1 External Interfaces
+### 6.1 BLE GATT Profile
 
-#### 6.1.1 WiFi Access Point
+#### 6.1.1 Custom Kubb-Checker Service
 
 | Attribute | Value |
 |-----------|-------|
-| SSID | `KubbChecker-{HUB_MAC_LAST_4}` |
-| Authentication | Open (no password) (assumed) |
-| Channel | 1 (default; must match ESP-NOW channel) |
-| Hub IP (gateway) | 192.168.4.1 |
-| DHCP range | 192.168.4.2 – 192.168.4.20 |
+| Service Name | Kubb-Checker Service |
+| Service UUID | `F4B20000-3E1A-4B7C-9A8D-2C6E1F0A5B3D` (placeholder — finalize during Phase 1) |
 
-#### 6.1.2 HTTP REST API
+#### 6.1.2 Characteristic Summary
 
-All endpoints served by the hub at `http://192.168.4.1/`.
-
-| Method | Path | Description | Request Body | Response |
-|--------|------|-------------|-------------|----------|
-| GET | `/` | Serve web interface SPA | — | HTML |
-| GET | `/api/sensors` | List all sensors with current state and last throw | — | JSON array |
-| GET | `/api/statistics` | Game statistics per sensor | — | JSON object |
-| POST | `/api/sensor/{mac}/name` | Assign name to sensor | `{"name":"Baton-A"}` | 200 OK |
-| POST | `/api/sensor/{mac}/calibrate` | Trigger gyro calibration | — | 200 OK |
-| POST | `/api/statistics/reset` | Reset all game statistics | — | 200 OK |
-| GET | `/api/ota/status` | Firmware version for hub and all sensors | — | JSON |
-| POST | `/api/ota/upload/sensor` | Upload sensor firmware binary to hub | Binary (multipart) | 200 OK |
-| POST | `/api/ota/upload/hub` | Upload hub firmware binary | Binary (multipart) | 200 OK |
-| POST | `/api/ota/sensor/{mac}` | Trigger OTA update for a specific sensor | — | 200 OK |
-| POST | `/api/ota/hub` | Trigger OTA self-update for hub | — | 200 OK |
-
-Sensor OTA firmware is served from:
-```
-GET http://192.168.4.1/firmware/sensor.bin
-```
-
----
+| Characteristic | UUID | Properties | Description |
+|---------------|------|------------|-------------|
+| Event | `F4B20001-3E1A-4B7C-9A8D-2C6E1F0A5B3D` | NOTIFY | Per-throw event; zero-loss queued delivery. |
+| Telemetry | `F4B20002-3E1A-4B7C-9A8D-2C6E1F0A5B3D` | NOTIFY | Continuous 10 Hz IMU stream; loss acceptable. |
+| Status | `F4B20003-3E1A-4B7C-9A8D-2C6E1F0A5B3D` | READ + NOTIFY | Battery, uptime, calibration state, firmware version. |
+| Control | `F4B20004-3E1A-4B7C-9A8D-2C6E1F0A5B3D` | WRITE | Commands from app to sensor. |
 
 ### 6.2 Internal Interfaces
 
-#### 6.2.1 I2C: ESP32-C3 ↔ BMI160
+#### 6.2.1 BMI160 I2C Interface
 
-| Attribute | Value |
+| Parameter | Value |
 |-----------|-------|
 | Protocol | I2C |
-| Frequency | 400 kHz (Fast Mode) |
-| BMI160 address | 0x68 (SDO = GND) |
-| Data read | Gyroscope (X, Y, Z), Accelerometer (X, Y, Z) |
-| Mode | Polling (interrupt-driven as optional optimization) |
+| Clock frequency | 400 kHz (Fast Mode) |
+| I2C address | 0x68 (SDO = GND) |
+| Chip ID register | 0x00, expected value 0xD1 |
+| Sample rate | ≥ 100 Hz (ODR register ACC_CONF / GYR_CONF) |
+| Gyro full-scale | ±2000 °/s (GYR_RANGE = 0x00) |
+| Accel full-scale | ±16 g (ACC_RANGE = 0x0C) |
 
-#### 6.2.2 ESP-NOW: Sensor ↔ Hub
+### 6.3 Data Models / Payload Schemas
 
-| Attribute | Value |
-|-----------|-------|
-| Protocol | ESP-NOW (Espressif, IEEE 802.11-based) |
-| Topology | Star; hub MAC pre-configured in sensor firmware |
-| Max payload | 250 bytes |
-| Channel | Must match hub WiFi AP channel |
-| Encryption | Disabled (assumed) |
-| Delivery mode | Unicast with hardware ACK |
+All payloads are little-endian. MTU negotiation required for Event-Characteristic (39 bytes exceeds default 20-byte MTU; negotiate ≥ 64-byte MTU during connection setup).
 
----
+#### 6.3.1 Event-Characteristic Payload (39 bytes)
 
-### 6.3 Data Models / Schemas
+| Field | Type | Bytes | Unit | Description |
+|-------|------|-------|------|-------------|
+| `event_counter` | uint16 | 2 | # | Monotonically increasing per-throw counter |
+| `timestamp_ms` | uint32 | 4 | ms | Time since boot at impact detection |
+| `rotation_major` | float32 | 4 | ° | Total rotation around major axis during flight |
+| `rotation_minor` | float32 | 4 | ° | Total rotation around minor axis during flight |
+| `time_of_flight` | float32 | 4 | s | Flight duration (throw-start to impact) |
+| `height_m` | float32 | 4 | m | Estimated peak flight height (0 if not computed) |
+| `distance_m` | float32 | 4 | m | Estimated horizontal distance (0 if not computed) |
+| `max_trans_accel` | int16 | 2 | 0.01 m/s² | Maximum translational acceleration during flight |
+| `min_trans_accel` | int16 | 2 | 0.01 m/s² | Minimum translational acceleration during flight |
+| `avg_trans_accel` | int16 | 2 | 0.01 m/s² | Average translational acceleration during flight |
+| `max_rot_accel` | int16 | 2 | 0.1 °/s² | Maximum rotational acceleration during flight |
+| `min_rot_accel` | int16 | 2 | 0.1 °/s² | Minimum rotational acceleration during flight |
+| `avg_rot_accel` | int16 | 2 | 0.1 °/s² | Average rotational acceleration during flight |
+| `flags` | uint8 | 1 | — | Bit 0: 1=vertical rotation (valid), 0=helicopter (invalid); Bit 1: 1=≥360° rotation (valid), 0=insufficient |
 
-#### 6.3.1 ESP-NOW Packet Structures
+**Total: 39 bytes**
 
-All packets share a 1-byte `msg_type` header. All multi-byte integers are little-endian.
+#### 6.3.2 Telemetry-Characteristic Payload (18 bytes, 10 Hz)
 
-**Message Type Enum:**
+| Field | Type | Bytes | Unit | Description |
+|-------|------|-------|------|-------------|
+| `timestamp_ms` | uint32 | 4 | ms | Time since boot |
+| `gyro_x` | int16 | 2 | 0.01 °/s | Calibrated gyroscope X |
+| `gyro_y` | int16 | 2 | 0.01 °/s | Calibrated gyroscope Y |
+| `gyro_z` | int16 | 2 | 0.01 °/s | Calibrated gyroscope Z |
+| `accel_x` | int16 | 2 | 0.01 m/s² | Calibrated accelerometer X |
+| `accel_y` | int16 | 2 | 0.01 m/s² | Calibrated accelerometer Y |
+| `accel_z` | int16 | 2 | 0.01 m/s² | Calibrated accelerometer Z |
+| `motion_state` | uint8 | 1 | enum | 0=rest, 1=pre-throw, 2=in-flight, 3=post-impact, 4=shaking |
+| `is_shaking` | uint8 | 1 | bool | 1 if shake detected |
 
-| Value | Name | Direction |
-|-------|------|-----------|
-| 0x01 | STATUS | Sensor → Hub |
-| 0x02 | THROW_RESULT | Sensor → Hub |
-| 0x10 | CMD_SET_NAME | Hub → Sensor |
-| 0x11 | CMD_CALIBRATE | Hub → Sensor |
-| 0x12 | CMD_OTA_START | Hub → Sensor |
+**Total: 18 bytes**
 
-**STATUS packet (29 bytes):**
+#### 6.3.3 Status-Characteristic Payload (10 bytes)
 
-```c
-typedef struct __attribute__((packed)) {
-    uint8_t  msg_type;       // 0x01
-    uint8_t  mac[6];         // sensor MAC address
-    uint8_t  state;          // 0=Still, 1=Moving, 2=Flying
-    uint8_t  battery_soc;   // 0–100 %
-    uint32_t uptime_ms;     // sensor uptime at send time
-    char     name[15];       // user-assigned name, null-terminated
-    uint8_t  _pad;           // reserved
-} status_pkt_t;              // total: 29 bytes
-```
+| Field | Type | Bytes | Unit | Description |
+|-------|------|-------|------|-------------|
+| `battery_pct` | uint8 | 1 | % | Battery state-of-charge 0–100 |
+| `uptime_s` | uint32 | 4 | s | Seconds since boot |
+| `cal_status` | uint8 | 1 | enum | 0=uncalibrated, 1=calibrated, 2=in-progress, 3=error |
+| `fw_major` | uint8 | 1 | — | Firmware major version |
+| `fw_minor` | uint8 | 1 | — | Firmware minor version |
+| `fw_patch` | uint8 | 1 | — | Firmware patch version |
+| `reserved` | uint8 | 1 | — | Reserved; shall be 0 |
 
-**THROW_RESULT packet (29 bytes):**
+**Total: 10 bytes**
 
-```c
-typedef struct __attribute__((packed)) {
-    uint8_t  msg_type;           // 0x02
-    uint8_t  mac[6];             // sensor MAC address
-    uint32_t throw_start_ms;    // sensor uptime at throw start
-    uint32_t throw_end_ms;      // sensor uptime at landing
-    float    rotation_minor;    // integrated rotation, minor axis (degrees)
-    float    rotation_major;    // integrated rotation, major axis (degrees)
-    float    max_accel_long;    // max longitudinal acceleration (g)
-    uint8_t  is_valid;          // 1 if rotation_minor >= 360, else 0
-    uint8_t  seq_num;           // rolling sequence number (for dedup/retry)
-} throw_result_pkt_t;           // total: 29 bytes
-```
+### 6.4 Control-Characteristic Commands (App → Sensor)
 
-**CMD_SET_NAME packet (17 bytes):**
+All commands are WRITE (no response) or WRITE WITH RESPONSE. The first byte is the opcode.
 
-```c
-typedef struct __attribute__((packed)) {
-    uint8_t msg_type;   // 0x10
-    char    name[15];   // new name, null-terminated
-    uint8_t _pad;
-} cmd_set_name_t;
-```
-
-**CMD_CALIBRATE packet (2 bytes):**
-
-```c
-typedef struct __attribute__((packed)) {
-    uint8_t msg_type;   // 0x11
-    uint8_t _pad;
-} cmd_calibrate_t;
-```
-
-**CMD_OTA_START packet (6 bytes):**
-
-```c
-typedef struct __attribute__((packed)) {
-    uint8_t msg_type;    // 0x12
-    uint8_t hub_ip[4];  // hub IP for HTTP download (e.g., {192,168,4,1})
-    uint8_t _pad;
-} cmd_ota_start_t;
-```
-
-#### 6.3.2 HTTP JSON Schemas
-
-**GET /api/sensors:**
-
-```json
-{
-  "sensors": [
-    {
-      "mac": "AA:BB:CC:DD:EE:FF",
-      "name": "Baton-A",
-      "state": "Still",
-      "battery_soc": 87,
-      "last_seen_ms": 1500,
-      "firmware_version": "1.0.0",
-      "last_throw": {
-        "timestamp_ms": 1234567,
-        "rotation_minor_deg": 412.3,
-        "rotation_major_deg": 25.7,
-        "time_of_flight_ms": 850,
-        "max_accel_g": 15.2,
-        "is_valid": true
-      }
-    }
-  ]
-}
-```
-
-**GET /api/statistics:**
-
-```json
-{
-  "statistics": [
-    {
-      "mac": "AA:BB:CC:DD:EE:FF",
-      "name": "Baton-A",
-      "total_throws": 12,
-      "valid_throws": 9,
-      "rotation_minor_deg": { "min": 234.1, "max": 856.3, "avg": 421.7 },
-      "rotation_major_deg": { "min": 5.2,   "max": 89.3,  "avg": 31.1 },
-      "time_of_flight_ms":  { "min": 620,   "max": 1250,  "avg": 890  },
-      "max_accel_g":        { "min": 8.1,   "max": 22.4,  "avg": 14.2 }
-    }
-  ]
-}
-```
-
----
-
-### 6.4 Commands / Opcodes
-
-ESP-NOW command packets are defined in Section 6.3.1. HTTP control endpoints are defined in Section 6.1.2.
+| Opcode | Command | Payload | Description |
+|--------|---------|---------|-------------|
+| `0x01` | `CALIBRATE` | none | Start gyro calibration. Result reported via Status-Characteristic `cal_status`. |
+| `0x02` | `SET_NAME` | `[len: uint8][name: utf8, ≤20 chars]` | Set device name persistently in NVS. Advertising updated on next reboot. |
+| `0x03` | `START` | none | Resume IMU sampling and BLE notifications. |
+| `0x04` | `STOP` | none | Pause IMU sampling and BLE notifications (low-power). |
+| `0x05` | `SET_THRESHOLD` | `[id: uint8][value: float32]` | Update a throw-detection threshold in NVS. Threshold IDs in Appendix 10.2. |
+| `0x06` | `OTA_START` | `[ssid_len: uint8][ssid][pwd_len: uint8][pwd][url: utf8 remainder]` | Trigger WiFi OTA. Sensor connects to WiFi and downloads firmware from URL. |
+| `0x07` | `FACTORY_RESET` | none | Erase all NVS data and reboot. |
 
 ---
 
 ## 7. Operational Procedures
 
-### 7.1 First-Time Deployment
+### 7.1 Initial Setup (Pre-Game)
 
-#### 7.1.1 Hub Setup
+1. **Assemble hardware**: Insert charged sensor into baton; secure near center of gravity.
+2. **Flash firmware**: Flash sensor firmware via USB: `idf.py flash` (initial flash only; subsequent updates via OTA).
+3. **Record BLE MAC**: Open serial monitor; note `BLE MAC: XX:XX:XX:XX:XX:XX` logged at boot.
+4. **Program NFC tag**: Write BLE MAC and OOB pairing data to the NTAG215 tag using an NFC tag writer app (e.g., NFC Tools for Android). Affix tag to baton exterior.
+5. **Repeat** steps 1–4 for all 6 sensors.
+6. **Pair batons to app**: Open Kubb-Checker-App; tap phone to each baton's NFC tag; confirm BLE pairing prompt.
+7. **Calibrate**: For each baton: Settings → select baton → lay baton flat on stable surface → press "Calibrate" → wait for success confirmation.
+8. **Verify**: Check front page: all 6 baton areas connected, at-rest state, no pending throw events.
 
-1. Flash hub firmware via USB serial (initial flash only).
-2. Power on hub.
-3. Verify serial output: "Hub ready", SSID `KubbChecker-XXXX` logged.
-4. Connect mobile device to the hub's AP.
-5. Open browser at `http://192.168.4.1` and verify the web interface loads.
+### 7.2 Normal Gameplay
 
-#### 7.1.2 Sensor Setup (per sensor)
+1. Confirm all batons show "connected" status on the front page.
+2. Referee monitors the front page during throws.
+3. After each throw: the thrown baton's area highlights; red/green validity indicators update within ~1 s of impact.
+4. Referee announces validity based on the two indicators.
+5. Between throws: indicators show the last throw result until the next throw is detected.
 
-1. Flash sensor firmware via USB serial (initial flash only).
-2. Place sensor (or baton) on a flat, stationary surface.
-3. Power on sensor.
-4. Wait ≥ 3 s for gyroscope calibration to complete (serial logs offsets).
-5. Sensor registers with hub automatically on first ESP-NOW contact.
-6. In the hub web interface, locate the sensor by its MAC-derived default name.
-7. Assign a meaningful name (e.g., "Baton-1") via the web interface.
+### 7.3 Baton Identification
 
-#### 7.1.3 Full Deployment
+1. Open Settings sub-page.
+2. Ask the player to shake the baton rapidly.
+3. The corresponding baton entry in the list shows the shake indicator.
 
-Repeat sensor setup for all ≥ 6 sensors. Verify all sensors appear in the hub web interface before starting the game.
+### 7.4 Recalibration During a Game
 
----
+1. In Settings, select the baton requiring recalibration.
+2. Retrieve the baton; lay it flat on a stable, level surface.
+3. Press "Calibrate" in the app; confirm success before returning the baton to play.
 
-### 7.2 Normal Game Operation
+### 7.5 Firmware OTA Update
 
-1. Power on hub and all sensors at the game location.
-2. Sensors auto-calibrate at boot (hold or lay flat during power-on).
-3. Connect referee's mobile device to `KubbChecker-XXXX` AP.
-4. Open web interface; confirm all sensors are visible and show "Still".
-5. During game: after each throw, the web interface displays rotation, validity (green / red), and updated statistics.
-6. At end of game: press **Reset Statistics** for the next game session.
-
----
-
-### 7.3 Manual Gyroscope Calibration
-
-1. Place target baton on a flat, stationary surface.
-2. In the web interface, press **Calibrate** on the sensor's card.
-3. Hub sends CMD_CALIBRATE via ESP-NOW.
-4. Sensor runs calibration for ≥ 3 s; updated offsets stored in NVS.
-5. Serial debug confirms new calibration offsets.
-
----
-
-### 7.4 Sensor Renaming
-
-1. In the web interface, locate the sensor card.
-2. Enter a new name (max 15 characters) in the name field.
-3. Press **Set Name**.
-4. Hub sends CMD_SET_NAME via ESP-NOW.
-5. Sensor saves new name to NVS.
-6. Sensor includes new name in the next STATUS packet; web interface updates within ≤ 2 s.
-
----
-
-### 7.5 OTA Firmware Update — Sensor
-
-1. Build the new sensor firmware binary (`sensor.bin`).
-2. In the web interface: **Settings → OTA → Upload Sensor Firmware**; select `sensor.bin`.
-3. Locate the target sensor and press **Update Firmware**.
-4. Hub sends CMD_OTA_START via ESP-NOW.
-5. Sensor suspends normal operation; connects to hub AP as WiFi STA.
-6. Sensor downloads `http://192.168.4.1/firmware/sensor.bin`.
-7. Sensor verifies checksum, writes to OTA partition B, and reboots.
-8. Sensor reconnects to hub via ESP-NOW; web interface shows updated firmware version.
+1. Build and host the new firmware binary on an HTTP server accessible via WiFi.
+2. In the app (Phase 5 UI TBD), trigger `OTA_START` for the target baton, providing WiFi SSID, password, and firmware URL.
+3. Monitor serial console for OTA progress.
+4. Sensor reboots and applies new firmware; app reconnects automatically.
 
 > **Note:** The sensor does not detect throws during OTA. Complete active game rounds before updating.
 
----
+### 7.6 Factory Reset
 
-### 7.6 OTA Firmware Update — Hub
+1. Send `FACTORY_RESET` command via the Control-Characteristic from the app.
+2. Sensor erases all NVS and reboots with factory defaults.
+3. Re-pair and recalibrate as per Section 7.1.
 
-1. Build the new hub firmware binary (`hub.bin`).
-2. In the web interface: **Settings → OTA → Upload Hub Firmware**; select `hub.bin`.
-3. Press **Update Hub Firmware**.
-4. Hub writes firmware to OTA partition B and reboots (≈ 30–60 s downtime).
-5. Web clients reconnect automatically after hub reboots; verify updated version in UI.
+### 7.7 Recovery Procedures
 
----
-
-### 7.7 Statistics Reset
-
-1. Press **Reset Statistics** in the web interface.
-2. All game statistics (throw counts, min/max/avg values) are cleared in hub RAM.
-3. Individual sensor last-throw records are preserved; only aggregated statistics are reset.
-
----
-
-### 7.8 Recovery Procedures
-
-**Sensor missing from web interface (no status for > 10 s):**
-1. Check sensor serial for boot errors or calibration hang.
-2. Power-cycle the sensor.
-3. If calibration fails, ensure sensor is held stationary at power-on.
-
-**Hub web interface unreachable:**
-1. Verify mobile is connected to `KubbChecker-XXXX` (not to home WiFi).
-2. Navigate explicitly to `http://192.168.4.1`.
-3. If still unreachable, check hub serial for HTTP server errors.
-4. Power-cycle hub.
-
-**Sensor unresponsive after OTA (boot loop):**
-1. Power-cycle sensor; A/B rollback should restore the previous firmware automatically.
-2. Monitor serial for "rolling back to previous partition".
-3. If rollback does not succeed: connect via USB serial and flash factory firmware.
-
-**Hub unresponsive after OTA:**
-1. Power-cycle hub; A/B rollback triggers automatically on repeated boot failure.
-2. If rollback does not succeed: connect via USB serial and flash factory firmware.
+| Scenario | Action |
+|----------|--------|
+| Baton not visible in BLE scan | Check battery; power-cycle sensor; verify NFC tag was programmed correctly. |
+| Calibration sanity-check error | Ensure baton is completely at rest on a flat surface; retry. Check for nearby vibration sources. |
+| OTA failed / rollback triggered | Check serial log for error; re-attempt OTA with a verified firmware binary. |
+| App loses connection mid-game | App auto-reconnects; Event-Characteristic queue retains events for delivery on reconnect. |
+| Sensor crashes / watchdog reset | Sensor reboots and resumes advertising; reconnect from app. |
 
 ---
 
 ## 8. Verification & Validation
 
-### 8.1 Phase 1 Verification — Sensor Core (Standalone)
+### 8.1 Phase 1 Verification — BLE Connection
 
 | Test ID | Feature | Procedure | Success Criteria |
 |---------|---------|-----------|-----------------|
-| TC-1.1 | BMI160 Init | Power on sensor; monitor serial | "BMI160 OK, chip_id=0xD1" logged; no I2C error |
-| TC-1.2 | Gyro Calibration | Power on with sensor flat and still; wait 5 s | Calibration offsets logged; all offsets < 5 °/s |
-| TC-1.3 | State: Still → Moving | Slowly pick up baton | Serial shows state transition to "Moving" |
-| TC-1.4 | State: Moving → Flying → Still | Perform a throw; baton hits wall | Serial shows "Flying", then "Still" with throw result |
-| TC-1.5 | Rotation Measurement (minor) | Use motorized rig for exactly 360° minor rotation | Serial reports 360° ± 15° |
-| TC-1.6 | Rotation Measurement (major) | Rotate 180° around major axis manually | Serial reports 180° ± 15° |
-| TC-1.7 | Time-of-Flight | Throw with simultaneous stopwatch | Serial ToF within ± 100 ms of stopwatch |
-| TC-1.8 | Max Acceleration | Throw onto hard surface | Max accel logged; value between 5 g and 40 g |
-| TC-1.9 | Validity: Valid | Perform throw with confirmed ≥ 360° rotation | Serial shows `is_valid=true` |
-| TC-1.10 | Validity: Invalid | Perform throw with confirmed < 360° rotation | Serial shows `is_valid=false` |
-| TC-1.11 | Battery SoC | Monitor serial for 5 min with charged battery | SoC value (%) logged; > 50% when battery fully charged |
-| TC-1.12 | Spurious throw rejection | Slowly pick up and set down baton | No "Flying" state triggered |
-| TC-1.13 | Rapid successive throws | Two throws within 5 s | Both throws independently recorded in serial |
+| TC-P1-001 | BLE advertising | Power on sensor; scan with nRF Connect | `kastpinne-xxxx` visible within 5 s |
+| TC-P1-002 | BLE MAC serial log | Open serial monitor; power on sensor | `BLE MAC: XX:XX:XX:XX:XX:XX` logged at boot |
+| TC-P1-003 | NFC tap-to-pair | Tap phone to NFC tag | BLE pairing prompt appears in app |
+| TC-P1-004 | BLE connection | Accept pairing | Connection established; GATT services enumerated |
+| TC-P1-005 | Telemetry stream | Subscribe to Telemetry-Characteristic | Notifications received at ~10 Hz |
+| TC-P1-006 | Demo data content | Inspect telemetry payload | Gyro and accel fields contain demo-generated values |
+| TC-P1-007 | Reconnect after disconnect | Disconnect; wait 5 s | Sensor resumes advertising; app reconnects |
 
----
-
-### 8.2 Phase 2 Verification — Hub Core
+### 8.2 Phase 2 Verification — Real Gyro Data
 
 | Test ID | Feature | Procedure | Success Criteria |
 |---------|---------|-----------|-----------------|
-| TC-2.1 | Hub Boot | Power on hub; monitor serial | "Hub ready", ESP-NOW and WiFi AP initialized logged |
-| TC-2.2 | Sensor Registration | Power on sensor near hub | Hub serial logs sensor MAC as registered |
-| TC-2.3 | STATUS Reception | Monitor hub serial for 30 s | Hub logs sensor STATUS packets at ~1 s interval |
-| TC-2.4 | THROW_RESULT Reception | Perform throw with sensor | Hub serial shows throw result within 2 s of landing |
-| TC-2.5 | Validity Echo | Perform valid and invalid throw | Hub correctly mirrors Valid / Invalid from sensor |
-| TC-2.6 | Multi-Sensor (6 units) | Power on all 6 sensors | Hub registers all 6; no dropped STATUS packets over 2 min |
-| TC-2.7 | Statistics Computation | Perform 5 throws with same sensor | Hub serial shows correct min/max/avg after each throw |
-| TC-2.8 | Statistics Reset | Issue reset via hub serial | All statistics cleared; confirmed in subsequent serial output |
-| TC-2.9 | Battery SoC Relay | Monitor hub serial | SoC value from sensor visible on hub |
-| TC-2.10 | Sensor Rename | Send name command via hub serial | Hub stores name; sensor includes new name in next STATUS |
-| TC-2.11 | Calibration Command | Send calibration command via hub serial | Sensor serial confirms calibration run |
-| TC-2.12 | Concurrent Transmission | Two sensors throw within 500 ms of each other | Both throw results received by hub within 3 s; no corruption |
+| TC-P2-001 | Stationary IMU | Hold baton still; observe telemetry | Gyro ≈ 0 °/s; accel ≈ 9.8 m/s² on gravity axis |
+| TC-P2-002 | Rotation detection | Rotate baton ~90° around each axis | Corresponding gyro axis responds with correct sign |
+| TC-P2-003 | Acceleration detection | Move baton linearly | Corresponding accel axis changes magnitude |
+| TC-P2-004 | I2C error handling | Disconnect BMI160 SDA/SCL; boot | `[IMU] I2C error` logged; no crash or hang |
 
----
-
-### 8.3 Phase 3 Verification — Web Interface
+### 8.3 Phase 3 Verification — Calibration & Settings
 
 | Test ID | Feature | Procedure | Success Criteria |
 |---------|---------|-----------|-----------------|
-| TC-3.1 | Hub AP Visible | Power on hub | `KubbChecker-XXXX` SSID visible on mobile WiFi scan |
-| TC-3.2 | Web Interface Load | Connect mobile to AP; navigate to 192.168.4.1 | Interface loads within 3 s |
-| TC-3.3 | Sensor Card Appears | Power on sensor | Sensor card visible in UI within 2 s of first STATUS |
-| TC-3.4 | State Display Update | Move sensor | UI shows state change within 1 s; no page reload |
-| TC-3.5 | Throw Display | Perform throw | UI shows rotation, ToF, accel, validity within 2 s |
-| TC-3.6 | Validity Highlight | Perform valid and invalid throw | Valid: green highlight; Invalid: red highlight |
-| TC-3.7 | Statistics Update | Perform 3 throws | Statistics (avg, min, max) update correctly in UI |
-| TC-3.8 | Statistics Reset | Click Reset button | All statistics cleared; confirmed immediately in UI |
-| TC-3.9 | Sensor Rename | Enter new name; click Set Name | Name updates in UI within 2 s; persists after hub reboot |
-| TC-3.10 | Battery Display | Check SoC in UI | SoC percentage visible and plausible for each sensor |
-| TC-3.11 | Calibration via UI | Click Calibrate button | Sensor serial confirms calibration run within 5 s |
-| TC-3.12 | Multi-Client | Connect 3 phones to AP simultaneously | All 3 show identical data; no crash or slowdown |
-| TC-3.13 | Responsive Layout | Load UI on 360 px wide phone | All elements visible without horizontal scroll |
+| TC-P3-001 | Calibration success | Lay baton flat; trigger calibration from app | `[CAL] success` on serial; status = 1 (calibrated) |
+| TC-P3-002 | Calibration sanity check | Move baton during calibration trigger | Error code returned to app; calibration aborted |
+| TC-P3-003 | Calibration persistence | Calibrate; power-cycle sensor; check serial | Calibration values logged from NVS at boot |
+| TC-P3-004 | Baton name change | Enter new name in app; confirm | Control command sent; serial confirms NVS write |
+| TC-P3-005 | Name persistence | Change name; power-cycle; scan BLE | Advertising uses new name |
+| TC-P3-006 | 3D model synchronization | Rotate baton; observe 3D model in app | Model rotates matching physical movement in real time |
+| TC-P3-007 | Accelerometer bar graphs | Move baton along each axis | Corresponding bar graph responds proportionally |
 
----
-
-### 8.4 OTA Verification
+### 8.4 Phase 4 Verification — Throw Detection
 
 | Test ID | Feature | Procedure | Success Criteria |
 |---------|---------|-----------|-----------------|
-| TC-OTA-100 | Sensor OTA Success | Upload firmware V2; trigger sensor OTA from UI | Sensor reboots with V2 firmware; reconnects to hub; UI shows new version |
-| TC-OTA-101 | Sensor OTA Rollback | Flash intentionally broken sensor firmware via OTA | Sensor rolls back to V1 automatically; normal operation resumes |
-| TC-OTA-102 | Hub OTA Success | Upload firmware V2; trigger hub OTA | Hub reboots with V2; web UI functional; version updated |
-| TC-OTA-103 | Version Reporting | Check firmware version in UI after OTA | Correct version string displayed for hub and all sensors |
-| EC-OTA-200 | Network Loss During OTA | Drop WiFi connection at 50% download | No brick; sensor reverts to normal; OTA retry succeeds |
-| EC-OTA-201 | Power Loss During OTA Write | Cut power mid-flash | Previous firmware boots on power restore (A/B scheme) |
-| EC-OTA-202 | Invalid Firmware Rejection | Upload random binary; trigger sensor OTA | Rejected (checksum fail); original firmware intact |
-| EC-OTA-203 | OTA During Active Use | Trigger OTA while hub is receiving throw events from other sensors | Other sensors continue operating; hub serves OTA file; no crash |
+| TC-P4-001 | Throw detection | Perform 10 throws | Event notification received for each throw; no missed events |
+| TC-P4-002 | Throw counter monotonicity | 10 throws; check `event_counter` | Values 1–10 in order; no gaps |
+| TC-P4-003 | Rotation measurement | Throw with known ~360° rotation | `rotation_minor` reported within ±30° of reference |
+| TC-P4-004 | Valid throw classification | 10 vertical throws (end-over-end) | `flags` bit 0 = 1 for all valid throws |
+| TC-P4-005 | Helicopter throw detection | 5 helicopter-style throws | `flags` bit 0 = 0 for all helicopter throws |
+| TC-P4-006 | Sufficient rotation flag | Throw with confirmed ≥ 360° | `flags` bit 1 = 1 |
+| TC-P4-007 | Insufficient rotation flag | Partial throw (< 360°) | `flags` bit 1 = 0 |
+| TC-P4-008 | Time-of-flight | Throw with simultaneous manual timing | `time_of_flight` within ±0.2 s of reference |
+| TC-P4-009 | Front page validity indicators | Valid throw | Both indicators show green on front page |
+| TC-P4-010 | Front page helicopter indicator | Helicopter throw | Rotation-axis indicator shows red; rotation indicator independent |
+| TC-P4-011 | Last-thrown baton highlight | Throw baton 2 of 2 connected | Baton 2 area highlighted on front page |
+| TC-P4-012 | No event data loss | 20 consecutive throws | `event_counter` increments without gaps |
 
----
-
-### 8.5 Serial Logging Verification
+### 8.5 Phase 5 Verification — Status & Feature Completeness
 
 | Test ID | Feature | Procedure | Success Criteria |
 |---------|---------|-----------|-----------------|
-| TC-LOG-100 | Serial Boot Log | Power on sensor; monitor serial | Firmware version, chip ID, calibration result logged at boot |
-| TC-LOG-103 | State Transition Logging | Cycle sensor through Still → Moving → Flying → Still | All transitions logged with timestamp and component tag |
-| EC-LOG-203 | Crash Log Capture | Trigger crash (e.g., stack overflow test) | Backtrace and reset reason visible on serial |
+| TC-P5-001 | Battery level | Read Status-Characteristic | Battery % displayed; value plausible for charge level |
+| TC-P5-002 | Uptime counter | Read Status twice 60 s apart | `uptime_s` increments by ~60 |
+| TC-P5-003 | Firmware version | Read Status | Version matches build tag (e.g., `1.0.0`) |
+| TC-P5-004 | Calibration status | Read Status before and after calibration | `cal_status` transitions 0 → 1 after successful calibration |
+| TC-P5-005 | Shake detection | Shake baton rapidly | `is_shaking` = 1 in telemetry; shake indicator visible in app settings |
+| TC-P5-006 | STOP command | Send STOP via Control | IMU and BLE notifications pause; no crash |
+| TC-P5-007 | START command | Send START after STOP | Notifications resume; normal operation |
+| TC-P5-008 | OTA update | Trigger OTA with valid firmware URL | Firmware updated; `fw_major/minor/patch` updated in Status |
+| TC-P5-009 | OTA rollback | Flash intentionally bad firmware via OTA | Sensor reboots; old version restored; confirmed via Status |
 
----
+### 8.6 Phase 6 Verification — Multi-Baton
 
-### 8.6 Acceptance Tests
+| Test ID | Feature | Procedure | Success Criteria |
+|---------|---------|-----------|-----------------|
+| TC-P6-001 | 6 simultaneous connections | Connect 6 batons | All 6 show connected status on front page |
+| TC-P6-002 | 6-baton telemetry | Observe front page | All 6 areas show live motion-state updates |
+| TC-P6-003 | Concurrent throw events | Throw 2 batons within 1 s | Both events received; correctly attributed to each baton area |
+| TC-P6-004 | App responsiveness | 6 batons active; navigate all pages | No perceptible UI lag on front page or settings |
+| TC-P6-005 | Baton identification (shake) | Shake baton 3; observe settings | Baton 3 entry shows shake indicator; others do not |
+
+### 8.7 Acceptance Tests
 
 | Test ID | Scenario | Procedure | Success Criteria |
+|---------|----------|-----------|-----------------|
+| AT-001 | Full game simulation | 6 batons; simulate 30 min of play (~30 throws) | All events received; no crashes; validity classifications correct |
+| AT-002 | Classification accuracy | 30 confirmed-valid + 30 confirmed-invalid reference throws | ≥ 90% classification accuracy on both criteria |
+| AT-003 | Battery endurance | Fully charge all 6 batons; run 2-hour game session | All batons operational at session end |
+| AT-004 | Mechanical durability | Throw each baton 50 times onto grass and wooden blocks | No sensor malfunction; I2C stable; no crashes |
+| AT-005 | BLE range | Deploy across full Kubb field (~8 m × 5 m) | All 6 BLE connections stable across full field area |
+| AT-006 | UI layout — front page | Connect 6 batons; observe front page | Title centered; 6 equal areas; validity indicators; gear button present |
+| AT-007 | UI layout — settings | Navigate to settings; select baton | Baton list shows MAC/name; sub-sub-page opens with 3D model |
+| AT-008 | Physical fit | Assemble full sensor + battery into baton | Electronics fit entirely within baton; baton closes and is throwable |
+
+### 8.8 BLE Standard Test Cases
+
+The following tests are drawn from the BLE standard test specification and apply to the Kubb-Checker-Sensor.
+
+| Test ID | Feature | Procedure | Success Criteria |
 |---------|---------|-----------|-----------------|
-| AT-1 | Full Game Session | Deploy 6 sensors + hub; play a complete game (≥ 20 throws) | All throws recorded; statistics correct; no data loss |
-| AT-2 | Valid Throw Confirmation | Throw with confirmed ≥ 360° rotation (video reference at 240 fps) | System reports Valid; measured rotation within ± 15° of video analysis |
-| AT-3 | Invalid Throw Confirmation | Throw with confirmed < 360° rotation (held back deliberately) | System reports Invalid |
-| AT-4 | Long Session (3 hours) | Run system for 3 hours with throw activity every few minutes | No sensor battery failure; no hub crash; all statistics intact |
-| AT-5 | OTA During Game Pause | Trigger OTA update for one sensor between game rounds | OTA completes; sensor reconnects; game statistics preserved |
-| AT-6 | Multi-Client Real-Time | Referee + 3 spectators connected to hub AP during active game | All 4 clients see identical real-time throw results |
+| TC-BLE-100 | Discovery and connection | Power on; scan; connect; enumerate services; disconnect | All steps succeed; advertising resumes after disconnect |
+| TC-BLE-102 | GATT read/write | Read Status; write Control; read back; write invalid data | All GATT operations behave per characteristic properties; invalid write returns error |
+| TC-BLE-103 | Notification latency | Subscribe to Telemetry; trigger data change; measure latency | Latency ≤ 100 ms; 10 rapid changes all received in order |
+| EC-BLE-200 | Disconnect during transfer | Connect; begin large payload; force disconnect | No crash; device resumes advertising; reconnect succeeds |
+| EC-BLE-201 | Rapid connect/disconnect cycles | 20 rapid connect/disconnect cycles | No memory leak; device remains functional |
+| EC-BLE-204 | Bonding persistence | Pair and bond; reboot device; reconnect | Reconnects without re-pairing; factory reset clears bonding |
 
----
+### 8.9 NVS Standard Test Cases
 
-### 8.7 Traceability Matrix
+| Test ID | Feature | Procedure | Success Criteria |
+|---------|---------|-----------|-----------------|
+| TC-NVS-100 | Config persistence across reboot | Write name and calibration; reboot | Values match after reboot and power cycle |
+| TC-NVS-101 | Default values on first boot | Erase NVS; boot device | Default device name used; no crash; defaults logged |
+| EC-NVS-200 | NVS corruption recovery | Corrupt NVS partition; boot | Falls back to defaults; no crash |
+| EC-NVS-202 | Power loss during NVS write | Cut power during calibration save | Either old or new value present; no corruption |
+
+### 8.10 OTA Standard Test Cases
+
+| Test ID | Feature | Procedure | Success Criteria |
+|---------|---------|-----------|-----------------|
+| TC-OTA-100 | Successful OTA update | Upload firmware V2; trigger OTA | V2 running after reboot; all features operational |
+| TC-OTA-101 | OTA rollback on bad firmware | Flash intentionally broken firmware | Sensor rolls back to V1 automatically; no manual action needed |
+| EC-OTA-202 | Invalid firmware rejection | Attempt OTA with random binary | Rejected — checksum/magic fail; original firmware intact |
+
+### 8.11 Traceability Matrix
 
 | Requirement | Priority | Test Case(s) | Status |
-|-------------|----------|-------------|--------|
-| FR-1.1 | Must | TC-1.1 | Covered |
-| FR-1.2 | Must | TC-1.5, TC-1.6 | Covered |
-| FR-1.3 | Must | TC-1.5, TC-1.8 | Covered |
-| FR-1.4 | Must | TC-1.5, TC-1.6 | Covered |
-| FR-1.5 | Must | TC-1.8 | Covered |
-| FR-1.6 | Must | TC-1.2, TC-1.5 | Covered |
-| FR-1.7 | Must | TC-1.2, TC-1.5 | Covered |
-| FR-1.8 | Must | TC-1.2 | Covered |
-| FR-1.9 | Must | TC-3.11 | Covered |
-| FR-2.1 | Must | TC-1.3, TC-1.4 | Covered |
-| FR-2.2 | Must | TC-1.3 | Covered |
-| FR-2.3 | Must | TC-1.4, AT-2 | Covered |
-| FR-2.4 | Must | TC-1.4 | Covered |
-| FR-2.5 | Should | TC-1.12 | Covered |
-| FR-2.6 | Should | — | GAP |
-| FR-3.1 | Must | TC-1.5, AT-2 | Covered |
-| FR-3.2 | Must | TC-1.6 | Covered |
-| FR-3.3 | Must | TC-1.7 | Covered |
-| FR-3.4 | Must | TC-1.8 | Covered |
-| FR-3.5 | Must | TC-1.9, TC-1.10, AT-3 | Covered |
-| FR-3.6 | Must | TC-2.4 | Covered |
-| FR-4.1 | Must | TC-2.2 | Covered |
-| FR-4.2 | Must | TC-2.3 | Covered |
-| FR-4.3 | Must | TC-2.4 | Covered |
-| FR-4.4 | Must | TC-2.4, TC-2.5 | Covered |
-| FR-4.5 | Should | TC-2.12 | Covered |
-| FR-4.6 | Must | TC-2.10, TC-2.11 | Covered |
-| FR-5.1 | Must | TC-2.10, TC-3.9 | Covered |
-| FR-5.2 | Must | TC-3.9 | Covered |
-| FR-5.3 | Must | TC-2.2 | Covered |
-| FR-5.4 | Must | TC-3.9 | Covered |
-| FR-5.5 | Must | TC-2.3 | Covered |
-| FR-6.1 | Must | TC-1.11 | Covered |
-| FR-6.2 | Must | TC-1.11 | Covered |
-| FR-6.3 | Must | TC-2.9 | Covered |
-| FR-6.4 | Should | — | GAP |
-| FR-7.1 | Must | TC-2.2, TC-2.6 | Covered |
-| FR-7.2 | Must | TC-2.2, TC-3.9 | Covered |
-| FR-7.3 | Must | TC-2.4, TC-3.5 | Covered |
-| FR-7.4 | Must | TC-2.7 | Covered |
-| FR-7.5 | Must | TC-2.7, TC-3.7 | Covered |
-| FR-7.6 | Must | TC-2.8, TC-3.8 | Covered |
-| FR-7.7 | Must | TC-2.10, TC-2.11 | Covered |
-| FR-7.8 | Should | TC-2.4 | Covered |
-| FR-8.1 | Must | TC-3.1 | Covered |
-| FR-8.2 | Must | TC-3.1 | Covered |
-| FR-8.3 | Must | TC-3.2 | Covered |
-| FR-8.4 | Must | TC-3.2 | Covered |
-| FR-8.5 | Should | TC-3.12 | Covered |
-| FR-8.6 | Should | TC-3.4, TC-3.5 | Covered |
-| FR-9.1 | Must | TC-3.3, TC-3.5 | Covered |
-| FR-9.2 | Must | TC-3.6 | Covered |
-| FR-9.3 | Must | TC-3.7 | Covered |
-| FR-9.4 | Must | TC-3.10 | Covered |
-| FR-9.5 | Should | TC-3.4, TC-3.5 | Covered |
-| FR-9.6 | Should | TC-3.13 | Covered |
-| FR-10.1 | Must | TC-3.9 | Covered |
-| FR-10.2 | Must | TC-3.11 | Covered |
-| FR-10.3 | Must | TC-3.8 | Covered |
-| FR-10.4 | Must | TC-OTA-100, TC-OTA-102 | Covered |
-| FR-11.1 | Must | TC-OTA-100, TC-OTA-102 | Covered |
-| FR-11.2 | Must | TC-OTA-101, EC-OTA-201 | Covered |
-| FR-11.3 | Must | EC-OTA-202 | Covered |
-| FR-11.4 | Must | TC-OTA-101, EC-OTA-201 | Covered |
-| FR-11.5 | Must | TC-OTA-100 | Covered |
-| FR-11.6 | Must | TC-OTA-100 | Covered |
-| FR-11.7 | Should | TC-OTA-103 | Covered |
-| FR-11.8 | Should | TC-OTA-103 | Covered |
-| FR-12.1 | Must | TC-1.3, TC-1.4, TC-LOG-103 | Covered |
-| FR-12.2 | Must | TC-1.2, TC-LOG-100 | Covered |
-| FR-12.3 | Must | TC-1.11 | Covered |
-| FR-12.4 | Must | TC-2.4, TC-2.7 | Covered |
-| FR-12.5 | Should | TC-LOG-100 | Covered |
-| NFR-1.1 | Must | TC-1.5, TC-1.6, AT-2 | Covered |
-| NFR-1.2 | Must | TC-1.4, AT-2 | Covered |
-| NFR-1.3 | Must | TC-1.4, AT-2 | Covered |
-| NFR-2.1 | Must | TC-2.6, AT-1 | Covered |
-| NFR-2.2 | Should | TC-2.4 | Covered |
-| NFR-2.3 | Should | TC-3.5 | Covered |
-| NFR-3.1 | Should | AT-4 | Covered |
-| NFR-3.2 | Should | AT-4 | Covered |
-| NFR-4.1 | Should | TC-3.12 | Covered |
-| NFR-5.1 | Must | TC-1.13 | Covered |
-| NFR-5.2 | Should | TC-2.12 | Covered |
+|------------|----------|-------------|--------|
+| FR-1.1 | Must | TC-P1-001, TC-P3-005 | Covered |
+| FR-1.2 | Must | TC-P1-007 | Covered |
+| FR-1.3 | Must | TC-P1-004 | Covered |
+| FR-1.4 | Must | TC-P4-012 | Covered |
+| FR-1.5 | Must | TC-P1-005, TC-P1-006 | Covered |
+| FR-1.6 | Should | TC-P5-001, TC-P5-002, TC-P5-003 | Covered |
+| FR-1.7 | Must | TC-P3-001, TC-P5-006, TC-P5-007, TC-P5-008 | Covered |
+| FR-1.8 | Must | TC-P1-002 | Covered |
+| FR-1.9 | Should | TC-P1-007 | Covered |
+| FR-2.1 | Must | TC-P2-001, TC-P2-004 | Covered |
+| FR-2.2 | Must | TC-P2-001, TC-P2-002, TC-P2-003 | Covered |
+| FR-2.3 | Must | TC-P2-001, TC-P2-002 | Covered |
+| FR-2.4 | Must | TC-P3-001, TC-P3-003 | Covered |
+| FR-2.5 | Must | TC-P2-004 | Covered |
+| FR-3.1 | Must | TC-P3-001 | Covered |
+| FR-3.2 | Must | TC-P3-002 | Covered |
+| FR-3.3 | Must | TC-P3-001 | Covered |
+| FR-3.4 | Must | TC-P3-003 | Covered |
+| FR-3.5 | Must | TC-P3-001, TC-P3-002, TC-P5-004 | Covered |
+| FR-4.1 | Must | TC-P4-001 | Covered |
+| FR-4.2 | Must | TC-P4-001 | Covered |
+| FR-4.3 | Must | TC-P4-001 | Covered |
+| FR-4.4 | Must | TC-P4-003 | Covered |
+| FR-4.5 | Must | TC-P4-003, TC-P4-006, TC-P4-007 | Covered |
+| FR-4.6 | Must | TC-P4-004, TC-P4-005, AT-002 | Covered |
+| FR-4.7 | Must | TC-P4-008 | Covered |
+| FR-4.8 | Should | TC-P4-008 | Partially Covered |
+| FR-4.9 | Must | TC-P4-012 | Covered |
+| FR-5.1 | Must | TC-P5-005 | Covered |
+| FR-5.2 | Must | TC-P5-005 | Covered |
+| FR-6.1 | Must | TC-P3-004, TC-P3-005, TC-NVS-100 | Covered |
+| FR-6.2 | Must | TC-P3-003, TC-NVS-100 | Covered |
+| FR-6.3 | Must | TC-P3-003 | Covered |
+| FR-6.4 | Must | TC-NVS-101 | Covered |
+| FR-6.5 | Should | TC-P1-002 | Covered |
+| FR-7.1 | Must | TC-P5-008 | Covered |
+| FR-7.2 | Must | EC-OTA-202 | Covered |
+| FR-7.3 | Must | TC-P5-009, TC-OTA-101 | Covered |
+| FR-7.4 | Must | TC-P5-009, TC-OTA-101 | Covered |
+| FR-7.5 | Should | TC-P5-008 | Covered |
+| FR-8.1 | Must | TC-P1-002 | Covered |
+| FR-8.2 | Must | TC-P1-003 | Covered |
+| FR-9.1 | Must | TC-P1-002 | Covered |
+| FR-9.2 | Must | TC-P2-004, TC-P3-001, TC-P4-001 | Covered |
+| FR-9.3 | Should | TC-P5-008 | Covered |
+| FR-9.4 | Should | TC-P1-002 | Covered |
+| FR-10.1 | Must | TC-P6-001 | Covered |
+| FR-10.2 | Must | TC-P1-003, TC-P1-004 | Covered |
+| FR-10.3 | Must | TC-P1-005 | Covered |
+| FR-10.4 | Must | TC-P3-001, TC-P5-006, TC-P5-007 | Covered |
+| FR-10.5 | Should | TC-P1-007 | Covered |
+| FR-11.1 | Must | AT-006 | Covered |
+| FR-11.2 | Must | TC-P6-001, AT-006 | Covered |
+| FR-11.3 | Must | TC-P4-009, TC-P4-010 | Covered |
+| FR-11.4 | Must | TC-P4-009, TC-P4-010 | Covered |
+| FR-11.5 | Must | TC-P4-011 | Covered |
+| FR-11.6 | Must | AT-006 | Covered |
+| FR-12.1 | Must | AT-007 | Covered |
+| FR-12.2 | Must | TC-P5-005 | Covered |
+| FR-12.3 | Must | AT-007 | Covered |
+| FR-13.1 | Must | AT-007 | Covered |
+| FR-13.2 | Must | TC-P3-006 | Covered |
+| FR-13.3 | Must | TC-P3-007 | Covered |
+| FR-13.4 | Must | TC-P3-001 | Covered |
+| FR-13.5 | Must | TC-P3-001, TC-P3-002 | Covered |
+| FR-14.1 | Must | TC-P3-004 | Covered |
+| FR-14.2 | Must | TC-P3-004 | Covered |
+| FR-14.3 | Must | TC-P3-005 | Covered |
+| NFR-1.1 | Must | TC-P2-001 | Covered |
+| NFR-1.2 | Must | AT-002 | Covered |
+| NFR-1.3 | Must | TC-P4-012 | Covered |
+| NFR-1.4 | Should | TC-BLE-103 | Covered |
+| NFR-1.5 | Must | AT-008 | Covered |
+| NFR-1.6 | Should | AT-004 | Covered |
+| NFR-2.1 | Must | AT-003 | Covered |
+| NFR-2.2 | Should | TC-P6-004 | Covered |
+| NFR-3.1 | Should | EC-NVS-202, TC-NVS-100 | Covered |
+| NFR-3.2 | Must | EC-OTA-202, TC-P5-009 | Covered |
+| NFR-4.1 | Should | TC-P3-006 | Covered |
+| NFR-5.1 | Should | TC-P1-002, TC-P1-003 | Covered |
 
 **GAP Summary:**
 
 | Requirement | Gap Reason |
 |-------------|-----------|
-| FR-2.6 | Pre-buffer functional test requires instrumented firmware or logic analyzer; deferred to hardware bring-up |
-| FR-6.4 | Low-battery warning observable via serial; no automated test defined — add if test harness allows battery discharge simulation |
+| FR-4.8 | Double-integration height/distance is best-effort; partial coverage via TC-P4-008 (time-of-flight test). Dedicated height/distance accuracy test deferred until Phase 4 field evaluation. |
 
 ---
 
@@ -1001,18 +869,19 @@ Repeat sensor setup for all ≥ 6 sensors. Verify all sensors appear in the hub 
 
 | Symptom | Likely Cause | Diagnostic Steps | Corrective Action |
 |---------|-------------|-----------------|-------------------|
-| Sensor not visible on hub web UI | ESP-NOW not reaching hub; sensor not booted | Check sensor serial for boot log; verify hub MAC is correct in sensor firmware | Power-cycle sensor; confirm hub was started first |
-| Sensor always shows "Still" when baton is moving | Gyro threshold too high or calibration failed | Check serial: are gyro readings near zero? Is "calibration complete" logged? | Re-run calibration; hold sensor flat and still at power-on |
-| All throws report "Invalid" despite visible rotation | BMI160 axis mapping incorrect; minor/major axis swapped | Check serial: compare `rotation_minor` vs `rotation_major` values | Swap the axis mapping constant in firmware; reflash |
-| Rotation value wildly wrong (e.g., 2000°) | Integration drift; sensor moved during calibration | Check calibration offsets on serial; repeat calibration on still surface | Re-calibrate; if persistent, verify I2C signal integrity |
-| Hub web UI not loading | Mobile on wrong network or wrong URL | Verify mobile is on `KubbChecker-XXXX`; try `http://192.168.4.1` explicitly | Disconnect from home WiFi; reconnect to hub AP |
-| Web UI data is stale (no updates) | Polling/WebSocket disconnected | Check browser console for network errors | Reload page |
-| Sensor OTA fails; sensor silent after reboot | Bad firmware or interrupted flash | Monitor sensor serial for rollback log | Power-cycle; A/B rollback should restore V1; if not, flash via USB |
-| Hub crashes / reboots after hub OTA | Bad hub firmware | Hub auto-reboots; A/B rollback activates | Power-cycle hub; if rollback fails, flash via USB |
-| Battery SoC always 0% | ADC pin misconfigured or voltage divider wrong | Check serial for raw ADC reading | Verify hardware voltage divider ratio; adjust ADC scaling constant |
-| Two sensors have the same display name | Both assigned identical name string | Identify by MAC address in UI | Rename one sensor with a unique name |
-| Spurious "Flying" events during pre-game setup | Detection thresholds too sensitive | Check serial for false "Flying" during slow movement | Increase `MOVING_TO_FLYING` gyro threshold and/or minimum flight duration |
-| ESP-NOW packet loss at far end of field | RF range or channel interference | Check hub serial for missing STATUS packets from specific sensor | Move hub closer to playing field center; change WiFi channel |
+| Sensor not visible in BLE scan | Battery dead; BLE init failed | Check serial log at boot; measure battery voltage | Charge/replace battery; reflash firmware |
+| NFC tap-to-pair not working | NFC tag not programmed or wrong MAC | Read tag with NFC tool; compare MAC to serial log | Reprogram NFC tag with correct BLE MAC |
+| App connects but no telemetry | CCCD not written; MTU too small | Inspect with nRF Connect; check CCCD subscription | Re-establish connection; verify MTU negotiation ≥ 64 bytes |
+| Telemetry shows all zeros | BMI160 I2C failure | Check serial for `[IMU] I2C error` | Re-solder I2C pins; verify BMI160 address (0x68 vs 0x69) |
+| Calibration always fails sanity check | Baton not truly at rest; surface vibration | Move to isolated stable surface; check serial for variance values | Increase sanity-check tolerance; check `thr_throw_accel` NVS value |
+| All throws classified invalid — helicopter | Minor-axis orientation algorithm incorrect; wrong axis mapping | Log rotation axis orientation vector during throws to serial | Verify body-frame vs. world-frame axis mapping in firmware |
+| All throws classified invalid — rotation | Calibration drift; minor-axis mapped to wrong BMI160 axis | Check `rotation_minor` vs `rotation_major` on serial — values swapped? | Swap axis mapping constant; recalibrate |
+| Events received but `event_counter` has gaps | BLE disconnection while event was queued; queue overflow | Check serial for `[BLE] event queued/dropped` | Verify event queue size is sufficient; ensure reliable BLE connection |
+| OTA fails immediately | WiFi credentials wrong; URL unreachable | Check serial for WiFi connect and HTTP error codes | Correct SSID/password; verify firmware server URL |
+| OTA applied but sensor boots old firmware | New firmware crashes at boot; watchdog triggers rollback | Check serial crash log before rollback message | Fix boot issue in new firmware; reflash via USB if needed |
+| App crashes with 6 batons connected | Android BLE connection limit; memory leak | Check logcat for BLE errors; check device BLE capability | Test with fewer connections; verify target device supports 6 BLE centrals |
+| 3D model lags or stutters | BLE receive thread blocking render thread | Profile app; check telemetry receive rate | Decouple BLE receive from render thread using ring buffer |
+| Battery SoC always 0% | ADC pin misconfigured; voltage divider wrong | Check serial for raw ADC value | Verify hardware voltage divider ratio; adjust scaling constant |
 
 ---
 
@@ -1020,39 +889,68 @@ Repeat sensor setup for all ≥ 6 sensors. Verify all sensors appear in the hub 
 
 ### 10.1 Configuration Defaults
 
-| Parameter | Default | Where |
+| Parameter | Default | Notes |
 |-----------|---------|-------|
-| Gyro sampling rate | 400 Hz | Sensor firmware |
-| Accel sampling rate | 100 Hz | Sensor firmware |
-| Gyro full-scale range | ±2000 °/s | Sensor firmware |
-| Accel full-scale range | ±16 g | Sensor firmware |
-| Still → Moving threshold | 50 °/s gyro magnitude | Sensor firmware |
-| Flying → Still impact threshold | 4 g peak accel | Sensor firmware |
-| Calibration hold duration | 3 s | Sensor firmware |
-| STATUS packet interval | 1000 ms | Sensor firmware |
-| THROW_RESULT retry timeout | 500 ms | Sensor firmware |
-| THROW_RESULT max retries | 3 | Sensor firmware |
-| LiIon SoC 0 % voltage | 3.00 V | Sensor firmware |
-| LiIon SoC 100 % voltage | 4.20 V | Sensor firmware |
-| BMI160 I2C address | 0x68 | Sensor firmware |
-| I2C clock frequency | 400 kHz | Sensor firmware |
-| Hub WiFi AP SSID | `KubbChecker-{MAC4}` | Hub firmware |
-| Hub WiFi AP channel | 1 | Hub firmware |
-| Hub IP address | 192.168.4.1 | Hub firmware |
-| DHCP pool | 192.168.4.2 – 192.168.4.20 | Hub firmware |
-| Serial baud rate | 115200 | Both |
+| IMU sample rate | 100 Hz | BMI160 ODR configuration |
+| Telemetry rate | 10 Hz | Subsampled from IMU |
+| Throw-start accel threshold | 15.0 m/s² | NVS key `thr_throw_accel`; SET_THRESHOLD ID 0x01 |
+| Throw-start rotation threshold | 200.0 °/s | NVS key `thr_throw_rot`; SET_THRESHOLD ID 0x02 |
+| Impact threshold | 20.0 m/s² | NVS key `thr_impact`; SET_THRESHOLD ID 0x03 |
+| Gravitational band min | 8.0 m/s² | SET_THRESHOLD ID 0x04 |
+| Gravitational band max | 10.5 m/s² | SET_THRESHOLD ID 0x05 |
+| Calibration averaging window | 2.0 s | Duration of bias averaging |
+| Calibration sanity threshold | 2.0 m/s² | Max variance from gravity during sanity check |
+| Min valid minor-axis rotation | 360.0 ° | Fixed by Kubb rules; not user-configurable |
+| Max helicopter axis angle | 45.0 ° | Angle from horizon; beyond this → helicopter |
+| Default device name prefix | `kastpinne-` | Followed by last 4 hex digits of BLE MAC |
+| NVS namespace | `kubb` | All sensor NVS keys |
+| Serial baud rate | 115200 | UART0 |
+| BLE advertise interval | 100 ms (assumed) | |
 
----
+### 10.2 SET_THRESHOLD Opcode IDs
 
-### 10.2 BMI160 Key Registers
+| ID | Parameter |
+|----|-----------|
+| 0x01 | Throw-start translational acceleration threshold (m/s²) |
+| 0x02 | Throw-start rotational velocity threshold (°/s) |
+| 0x03 | Impact acceleration threshold (m/s²) |
+| 0x04 | Gravitational band minimum (m/s²) |
+| 0x05 | Gravitational band maximum (m/s²) |
+
+### 10.3 BLE UUIDs (Placeholder)
+
+These UUIDs are placeholders. Use a UUID generator (e.g., `uuidgen`) to assign production UUIDs before Phase 1 implementation.
+
+| Name | UUID |
+|------|------|
+| Kubb-Checker Service | `F4B20000-3E1A-4B7C-9A8D-2C6E1F0A5B3D` |
+| Event Characteristic | `F4B20001-3E1A-4B7C-9A8D-2C6E1F0A5B3D` |
+| Telemetry Characteristic | `F4B20002-3E1A-4B7C-9A8D-2C6E1F0A5B3D` |
+| Status Characteristic | `F4B20003-3E1A-4B7C-9A8D-2C6E1F0A5B3D` |
+| Control Characteristic | `F4B20004-3E1A-4B7C-9A8D-2C6E1F0A5B3D` |
+
+### 10.4 Throw Detection State Machine
+
+```
+[REST] ──(accel > thr_throw_accel AND rot > thr_throw_rot)──► [PRE-THROW]
+[PRE-THROW] ──(accel drops into gravity band 8.0–10.5 m/s²)──► [IN-FLIGHT]
+[PRE-THROW] ──(threshold not sustained > 200 ms)──► [REST]   (false trigger)
+[IN-FLIGHT] ──(accel spike > thr_impact)──► [POST-IMPACT] → compute + transmit event
+[IN-FLIGHT] ──(timeout: flight > 5 s)──► [REST]             (missed impact)
+[POST-IMPACT] ──(accel < rest_threshold for 500 ms)──► [REST]
+[ANY STATE] ──(high-freq vibration burst < 500 ms, distinct from throw)──► [SHAKING]
+[SHAKING] ──(vibration ceases for 500 ms)──► [REST]
+```
+
+### 10.5 BMI160 Key Registers
 
 | Register | Address | Description |
 |----------|---------|-------------|
-| CHIP_ID | 0x00 | Shall read 0xD1 to confirm device present |
-| GYR_X_L/H | 0x0C/0x0D | Gyroscope X raw (16-bit, signed) |
+| CHIP_ID | 0x00 | Expected value: 0xD1 |
+| GYR_X_L/H | 0x0C/0x0D | Gyroscope X raw (16-bit signed) |
 | GYR_Y_L/H | 0x0E/0x0F | Gyroscope Y raw |
 | GYR_Z_L/H | 0x10/0x11 | Gyroscope Z raw |
-| ACC_X_L/H | 0x12/0x13 | Accelerometer X raw (16-bit, signed) |
+| ACC_X_L/H | 0x12/0x13 | Accelerometer X raw (16-bit signed) |
 | ACC_Y_L/H | 0x14/0x15 | Accelerometer Y raw |
 | ACC_Z_L/H | 0x16/0x17 | Accelerometer Z raw |
 | ACC_CONF | 0x40 | Accel ODR and bandwidth |
@@ -1063,9 +961,7 @@ Repeat sensor setup for all ≥ 6 sensors. Verify all sensors appear in the hub 
 
 Full register map: `Documentation/bst-bmi160-ds000.pdf`.
 
----
-
-### 10.3 LiIon 1S SoC Voltage Lookup Table
+### 10.6 LiIon 1S SoC Voltage Lookup Table
 
 | Cell Voltage (V) | SoC (%) |
 |------------------|---------|
@@ -1081,85 +977,11 @@ Full register map: `Documentation/bst-bmi160-ds000.pdf`.
 
 Interpolate linearly between table entries.
 
----
+### 10.7 NTAG215 NFC Tag OOB Pairing Format
 
-### 10.4 ESP-NOW / WiFi AP Channel Alignment
+The NFC tag shall contain a BLE OOB pairing NDEF record. Minimum required fields:
+- BLE Device Address (6 bytes, type `0x1B`)
+- BLE Role: Peripheral (`0x01`)
+- Security Manager OOB data (if required by NimBLE security configuration)
 
-ESP-NOW frames are sent on the current primary WiFi channel. The hub WiFi AP channel must match. Steps to ensure alignment:
-
-1. Set hub WiFi AP to channel 1 (or any chosen channel).
-2. Sensors automatically use the channel of the hub's AP beacon.
-3. If an external AP on channel 1 causes interference, change hub to channel 6 or 11 and update the compile-time default.
-
----
-
-### 10.5 Throw Detection State Machine
-
-```
-         ┌──────────────────────────────────────────────┐
-         │ (initial state / after landing)               │
-         ▼                                               │
-    ┌─────────┐    gyro mag > 50°/s                     │
-    │  STILL  │ ─────────────────────► ┌─────────┐      │
-    └─────────┘    sustained ≥ 20 ms   │  MOVING │      │
-                                        └─────────┘      │
-                                             │           │
-                              throw pattern  │           │
-                              detected       ▼           │
-                                        ┌─────────┐     │
-                                        │  FLYING │     │
-                                        └─────────┘     │
-                                             │           │
-                               impact ≥ 4 g │           │
-                                             ▼           │
-                                      [Compute result]   │
-                                      [TX THROW_RESULT]  │
-                                             └───────────┘
-```
-
----
-
-### 10.6 Sensor OTA Sequence
-
-```
-[Web UI: click "Update Firmware" for sensor MAC]
-         │
-         ▼
-[Hub: POST /api/ota/sensor/{mac}]
-         │
-         ▼
-[Hub: send CMD_OTA_START via ESP-NOW → sensor]
-         │
-         ▼
-[Sensor: suspend ESP-NOW, start WiFi STA]
-         │
-         ▼
-[Sensor: connect to KubbChecker-XXXX AP]
-         │
-         ▼
-[Sensor: HTTP GET http://192.168.4.1/firmware/sensor.bin]
-         │
-    ┌────┴────────────────────────────────┐
-    │ Download OK?                         │
-    │ YES                          NO      │
-    ▼                              ▼       │
-[Write to OTA          [Abort; log error;  │
- partition B]           disconnect STA;    │
-    │                   reconnect ESP-NOW] │
-    ▼                                      │
-[Verify checksum]                          │
-    │                                      │
-    ├── FAIL ──────────────────────────────┘
-    │
-    ▼ PASS
-[Set boot partition B; reboot]
-         │
-         ▼
-[Boot from B; mark B valid]
-         │
-         ▼
-[Reconnect to hub via ESP-NOW]
-         │
-         ▼
-[Hub web UI: firmware version updated]
-```
+Recommended writing tool: NFC Tools (Android) or nRF Connect NFC tab → Write OOB BLE record.
